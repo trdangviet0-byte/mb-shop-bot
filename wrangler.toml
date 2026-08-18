@@ -1,0 +1,22 @@
+name = "mb-shop-complete"
+main = "src/index.js"
+compatibility_date = "2026-08-18"
+
+[triggers]
+crons = ["*/1 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mb-shop-db"
+database_id = "REPLACE_D1_DATABASE_ID"
+
+[vars]
+SHOP_NAME = "RUS TAY IOS STORE"
+BANK_NAME = "MB Bank"
+BANK_ACCOUNT_NAME = "CHU TK CUA BAN"
+MIN_DEPOSIT = "10000"
+PAYMENT_EXPIRE_MINUTES = "15"
+ADMIN_USERNAME = "@RusTayIOS"
+SUPPORT_TEXT = "Nếu cần hỗ trợ, vui lòng liên hệ Admin."
+MB_TOKEN_METHOD = "POST"
+MB_TRANSACTION_METHOD = "GET"
