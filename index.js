@@ -48,9 +48,9 @@ async function ensureUser(env, from) {
 
 function homeKeyboard(){
   return {inline_keyboard:[
-    [{text:"🛍️ Mua Key / Acc",callback_data:"buy"},{text:"💳 Nạp Tiền",callback_data:"deposit"}],
+    [{text:"🛍️ Mua Key / Acc FF",callback_data:"buy"},{text:"💳 Nạp Tiền",callback_data:"deposit"}],
     [{text:"💎 Cá Nhân",callback_data:"profile"},{text:"🏆 Top Nạp",callback_data:"top"}],
-    [{text:"📜 Lịch Sử Nạp",callback_data:"history"},{text:"🔐 Hỗ Trợ",callback_data:"support"}]
+    [{text:"📜 Lịch Sử Nạp",callback_data:"history"},{text:"🧑‍💻 Hỗ Trợ",callback_data:"support"}]
   ]};
 }
 
