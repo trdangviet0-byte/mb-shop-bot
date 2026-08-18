@@ -1,8 +1,8 @@
 const ADMIN_ID = "7424477198";
 
-function isAdmin(userId) {
-  return String(userId) === ADMIN_ID;
-}
+/* =========================================================
+   CONFIG
+========================================================= */
 
 const PRODUCTS = [
   ["fluorite", "Fluorite"],
@@ -28,7 +28,26 @@ const DEFAULT_ITEMS = [
   ["31 Ngày", 450000, 1273]
 ];
 
-const enc = new TextEncoder();
+
+/* =========================================================
+   CACHE
+========================================================= */
+
+let seedPromise = null;
+
+let tokenCache = {
+  value: null,
+  expires: 0
+};
+
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function isAdmin(userId) {
+  return String(userId) === ADMIN_ID;
+}
 
 const money = n =>
   Number(n || 0).toLocaleString("vi-VN") + "đ";
@@ -48,14 +67,40 @@ const rid = prefix =>
   prefix +
   crypto.randomUUID()
     .replace(/-/g, "")
-    .slice(0, 10)
+    .slice(0, 12)
     .toUpperCase();
 
 const nowISO = () =>
   new Date().toISOString();
 
 const addMin = min =>
-  new Date(Date.now() + min * 60000).toISOString();
+  new Date(
+    Date.now() + Number(min || 0) * 60000
+  ).toISOString();
+
+function parseMoney(text) {
+  const n = Number(
+    String(text || "")
+      .replace(/[^\d]/g, "")
+  );
+
+  return Number.isSafeInteger(n)
+    ? n
+    : NaN;
+}
+
+function slugify(text) {
+  const base = String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+
+  return base || "product";
+}
 
 
 /* =========================================================
@@ -63,86 +108,272 @@ const addMin = min =>
 ========================================================= */
 
 async function tg(env, method, body) {
-  const r = await fetch(
-    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify(body)
-    }
+  const controller = new AbortController();
+
+  const timeout = setTimeout(
+    () => controller.abort(),
+    20000
   );
 
-  const j = await r.json();
-
-  if (!j.ok) {
-    throw new Error(
-      `Telegram ${method}: ${j.description || r.status}`
+  try {
+    const r = await fetch(
+      `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      }
     );
-  }
 
-  return j.result;
+    const text = await r.text();
+
+    let j = {};
+
+    try {
+      j = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Telegram ${method}: invalid JSON`
+      );
+    }
+
+    if (!j.ok) {
+      throw new Error(
+        `Telegram ${method}: ${
+          j.description || r.status
+        }`
+      );
+    }
+
+    return j.result;
+
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 
 /* =========================================================
-   DATABASE SEED
+   DATABASE SETUP
 ========================================================= */
 
+async function ensureSchema(env) {
+  await env.DB.batch([
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS admin_states (
+        telegram_id TEXT PRIMARY KEY,
+        action TEXT NOT NULL,
+        payload TEXT DEFAULT '{}',
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS bot_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      )
+    `)
+  ]);
+
+  try {
+    await env.DB.prepare(`
+      ALTER TABLE deposits
+      ADD COLUMN notified_at TEXT
+    `).run();
+  } catch {}
+
+  try {
+    await env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_users_telegram
+      ON users(telegram_id)
+    `).run();
+  } catch {}
+
+  try {
+    await env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_deposits_status
+      ON deposits(status)
+    `).run();
+  } catch {}
+
+  try {
+    await env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_product_items_product
+      ON product_items(product_id)
+    `).run();
+  } catch {}
+}
+
+
 async function ensureSeed(env) {
-  const c = await env.DB
-    .prepare(
-      "SELECT COUNT(*) c FROM products"
-    )
-    .first();
+  if (seedPromise) {
+    return seedPromise;
+  }
 
-  if (c.c) return;
+  seedPromise = (async () => {
+    await ensureSchema(env);
 
-  const stmts = [];
+    const c = await env.DB
+      .prepare(
+        "SELECT COUNT(*) c FROM products"
+      )
+      .first();
 
-  PRODUCTS.forEach(([id, name], i) => {
-    stmts.push(
-      env.DB
-        .prepare(
-          "INSERT INTO products(id,name,sort_order) VALUES(?,?,?)"
-        )
-        .bind(
-          id,
-          name,
-          i
-        )
-    );
+    if (Number(c?.c || 0) > 0) {
+      return;
+    }
 
-    DEFAULT_ITEMS.forEach(
-      ([title, price, stock], j) => {
+    const stmts = [];
+
+    PRODUCTS.forEach(
+      ([id, name], i) => {
         stmts.push(
           env.DB
-            .prepare(
-              "INSERT INTO product_items(id,product_id,title,price,stock,sort_order) VALUES(?,?,?,?,?,?)"
-            )
+            .prepare(`
+              INSERT OR IGNORE INTO products(
+                id,
+                name,
+                sort_order,
+                active
+              )
+              VALUES(?,?,?,1)
+            `)
             .bind(
-              `${id}-${j + 1}`,
               id,
-              title,
-              price,
-              stock,
-              j
+              name,
+              i
             )
+        );
+
+        DEFAULT_ITEMS.forEach(
+          ([title, price, stock], j) => {
+            stmts.push(
+              env.DB
+                .prepare(`
+                  INSERT OR IGNORE INTO product_items(
+                    id,
+                    product_id,
+                    title,
+                    price,
+                    stock,
+                    sort_order
+                  )
+                  VALUES(?,?,?,?,?,?)
+                `)
+                .bind(
+                  `${id}-${j + 1}`,
+                  id,
+                  title,
+                  price,
+                  stock,
+                  j
+                )
+            );
+          }
         );
       }
     );
+
+    for (
+      let i = 0;
+      i < stmts.length;
+      i += 50
+    ) {
+      await env.DB.batch(
+        stmts.slice(i, i + 50)
+      );
+    }
+  })().catch(err => {
+    seedPromise = null;
+    throw err;
   });
 
-  for (
-    let i = 0;
-    i < stmts.length;
-    i += 40
-  ) {
-    await env.DB.batch(
-      stmts.slice(i, i + 40)
-    );
+  return seedPromise;
+}
+
+
+/* =========================================================
+   ADMIN STATE
+========================================================= */
+
+async function setAdminState(
+  env,
+  userId,
+  action,
+  payload = {}
+) {
+  await env.DB
+    .prepare(`
+      INSERT INTO admin_states(
+        telegram_id,
+        action,
+        payload,
+        updated_at
+      )
+      VALUES(?,?,?,?)
+      ON CONFLICT(telegram_id)
+      DO UPDATE SET
+        action=excluded.action,
+        payload=excluded.payload,
+        updated_at=excluded.updated_at
+    `)
+    .bind(
+      String(userId),
+      action,
+      JSON.stringify(payload),
+      nowISO()
+    )
+    .run();
+}
+
+
+async function getAdminState(
+  env,
+  userId
+) {
+  const state = await env.DB
+    .prepare(`
+      SELECT *
+      FROM admin_states
+      WHERE telegram_id=?
+    `)
+    .bind(String(userId))
+    .first();
+
+  if (!state) {
+    return null;
   }
+
+  let payload = {};
+
+  try {
+    payload = JSON.parse(
+      state.payload || "{}"
+    );
+  } catch {}
+
+  return {
+    ...state,
+    payload
+  };
+}
+
+
+async function clearAdminState(
+  env,
+  userId
+) {
+  await env.DB
+    .prepare(`
+      DELETE FROM admin_states
+      WHERE telegram_id=?
+    `)
+    .bind(String(userId))
+    .run();
 }
 
 
@@ -150,7 +381,10 @@ async function ensureSeed(env) {
    USER
 ========================================================= */
 
-async function ensureUser(env, from) {
+async function ensureUser(
+  env,
+  from
+) {
   await env.DB
     .prepare(`
       INSERT INTO users(
@@ -172,21 +406,93 @@ async function ensureUser(env, from) {
     .run();
 
   return env.DB
-    .prepare(
-      "SELECT * FROM users WHERE telegram_id=?"
-    )
-    .bind(
-      String(from.id)
-    )
+    .prepare(`
+      SELECT *
+      FROM users
+      WHERE telegram_id=?
+    `)
+    .bind(String(from.id))
     .first();
 }
 
 
 /* =========================================================
-   HOME KEYBOARD
+   SEND / EDIT
 ========================================================= */
 
-function homeKeyboard(userId = null) {
+async function sendOrEdit(
+  env,
+  chatId,
+  messageId,
+  text,
+  keyboard
+) {
+  const body = {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: keyboard,
+    disable_web_page_preview: true
+  };
+
+  if (!messageId) {
+    return tg(
+      env,
+      "sendMessage",
+      body
+    );
+  }
+
+  try {
+    return await tg(
+      env,
+      "editMessageText",
+      {
+        ...body,
+        message_id: messageId
+      }
+    );
+
+  } catch (e) {
+    const error = String(
+      e.message || e
+    );
+
+    if (
+      error.includes(
+        "message is not modified"
+      )
+    ) {
+      return null;
+    }
+
+    if (
+      error.includes(
+        "message can't be edited"
+      ) ||
+      error.includes(
+        "MESSAGE_ID_INVALID"
+      )
+    ) {
+      return tg(
+        env,
+        "sendMessage",
+        body
+      );
+    }
+
+    throw e;
+  }
+}
+
+
+/* =========================================================
+   HOME
+========================================================= */
+
+function homeKeyboard(
+  userId = null
+) {
   const rows = [
     [
       {
@@ -235,62 +541,22 @@ function homeKeyboard(userId = null) {
 }
 
 
-/* =========================================================
-   HOME
-========================================================= */
-
-function homeText(env, name = "bạn") {
+function homeText(
+  env,
+  name = "bạn"
+) {
   return (
-    `🎉 <b>Chào mừng ${esc(name)} đến với ${esc(
-      env.SHOP_NAME || "RUS TAY IOS STORE"
+    `🎉 <b>Chào mừng ${esc(
+      name
+    )} đến với ${esc(
+      env.SHOP_NAME ||
+      "RUS TAY IOS STORE"
     )}!</b>\n\n` +
+
     `Vui lòng chọn chức năng bên dưới để tiếp tục.`
   );
 }
 
-async function sendOrEdit(
-  env,
-  chatId,
-  messageId,
-  text,
-  keyboard
-) {
-  const body = {
-    chat_id: chatId,
-    text,
-    parse_mode: "HTML",
-    reply_markup: keyboard
-  };
-
-  if (messageId) {
-    try {
-      return await tg(
-        env,
-        "editMessageText",
-        {
-          ...body,
-          message_id: messageId
-        }
-      );
-    } catch (e) {
-      if (
-        String(e.message).includes(
-          "message is not modified"
-        )
-      ) {
-        return null;
-      }
-
-      throw e;
-    }
-  }
-
-  return tg(
-    env,
-    "sendMessage",
-    body
-  );
-}
 
 async function showHome(
   env,
@@ -299,11 +565,21 @@ async function showHome(
   name = "bạn",
   userId = null
 ) {
+  if (userId) {
+    await clearAdminState(
+      env,
+      userId
+    );
+  }
+
   return sendOrEdit(
     env,
     chatId,
     messageId,
-    homeText(env, name),
+    homeText(
+      env,
+      name
+    ),
     homeKeyboard(userId)
   );
 }
@@ -318,43 +594,76 @@ async function showAdminPanel(
   chatId,
   messageId
 ) {
-  const users = await env.DB
-    .prepare(
-      "SELECT COUNT(*) AS c FROM users"
-    )
-    .first();
+  const result = await env.DB.batch([
+    env.DB.prepare(`
+      SELECT COUNT(*) AS c
+      FROM users
+    `),
 
-  const pending = await env.DB
-    .prepare(
-      "SELECT COUNT(*) AS c FROM deposits WHERE status='PENDING'"
-    )
-    .first();
+    env.DB.prepare(`
+      SELECT COUNT(*) AS c
+      FROM deposits
+      WHERE status='PENDING'
+    `),
 
-  const paid = await env.DB
-    .prepare(
-      "SELECT COUNT(*) AS c FROM deposits WHERE status='PAID'"
-    )
-    .first();
+    env.DB.prepare(`
+      SELECT COUNT(*) AS c
+      FROM deposits
+      WHERE status='PAID'
+    `),
 
-  const totalBalance = await env.DB
-    .prepare(
-      "SELECT COALESCE(SUM(balance),0) AS total FROM users"
-    )
-    .first();
+    env.DB.prepare(`
+      SELECT
+        COALESCE(
+          SUM(balance),
+          0
+        ) AS total
+      FROM users
+    `),
 
-  const text = `
-⚙️ <b>ADMIN PANEL</b>
-━━━━━━━━━━━━
+    env.DB.prepare(`
+      SELECT COUNT(*) AS c
+      FROM products
+    `),
 
-👥 Tổng tài khoản: <b>${users.c}</b>
-⏳ Đơn nạp chờ duyệt: <b>${pending.c}</b>
-✅ Đơn đã duyệt: <b>${paid.c}</b>
-💰 Tổng số dư user: <b>${money(
-    totalBalance.total
-  )}</b>
+    env.DB.prepare(`
+      SELECT COUNT(*) AS c
+      FROM product_items
+    `)
+  ]);
 
-Chọn chức năng bên dưới:
-`;
+  const users =
+    result[0].results[0];
+
+  const pending =
+    result[1].results[0];
+
+  const paid =
+    result[2].results[0];
+
+  const balance =
+    result[3].results[0];
+
+  const products =
+    result[4].results[0];
+
+  const items =
+    result[5].results[0];
+
+  const text =
+    `⚙️ <b>ADMIN PANEL</b>\n` +
+    `━━━━━━━━━━━━\n\n` +
+
+    `👥 Tổng tài khoản: <b>${users.c}</b>\n` +
+    `📦 Danh mục: <b>${products.c}</b>\n` +
+    `🛍️ Gói sản phẩm: <b>${items.c}</b>\n` +
+    `⏳ Đơn nạp chờ: <b>${pending.c}</b>\n` +
+    `✅ Đơn đã duyệt: <b>${paid.c}</b>\n` +
+    `💰 Tổng số dư user: <b>${money(
+      balance.total
+    )}</b>\n\n` +
+
+    `<b>Chọn chức năng:</b>`;
 
   return sendOrEdit(
     env,
@@ -365,19 +674,43 @@ Chọn chức năng bên dưới:
       inline_keyboard: [
         [
           {
-            text: "⏳ Duyệt đơn nạp",
-            callback_data: "admin_deposits"
+            text: "📦 Quản Lý Sản Phẩm",
+            callback_data: "admin_products"
           }
         ],
         [
           {
-            text: "👥 Danh sách user",
+            text: "➕ Thêm Sản Phẩm",
+            callback_data: "admin_add_product"
+          },
+          {
+            text: "👁️ Xem Sản Phẩm",
+            callback_data: "admin_products"
+          }
+        ],
+        [
+          {
+            text: "💰 Cộng Tiền User",
+            callback_data: "admin_add_money"
+          },
+          {
+            text: "🔎 Tìm User",
+            callback_data: "admin_find_user"
+          }
+        ],
+        [
+          {
+            text: "⏳ Duyệt Đơn Nạp",
+            callback_data: "admin_deposits"
+          },
+          {
+            text: "👥 Danh Sách User",
             callback_data: "admin_users"
           }
         ],
         [
           {
-            text: "⬅️ Trang chủ",
+            text: "⬅️ Trang Chủ",
             callback_data: "home"
           }
         ]
@@ -386,6 +719,307 @@ Chọn chức năng bên dưới:
   );
 }
 
+
+/* =========================================================
+   ADMIN PRODUCTS
+========================================================= */
+
+async function showAdminProducts(
+  env,
+  chatId,
+  messageId
+) {
+  const result = await env.DB
+    .prepare(`
+      SELECT
+        p.*,
+        COUNT(i.id) AS item_count
+      FROM products p
+      LEFT JOIN product_items i
+        ON i.product_id=p.id
+      GROUP BY p.id
+      ORDER BY p.sort_order,p.name
+      LIMIT 100
+    `)
+    .all();
+
+  let text =
+    `📦 <b>QUẢN LÝ SẢN PHẨM</b>\n` +
+    `━━━━━━━━━━━━\n\n`;
+
+  if (!result.results.length) {
+    text +=
+      `Chưa có sản phẩm.`;
+  } else {
+    text +=
+      `Chọn sản phẩm để quản lý:\n`;
+  }
+
+  const rows = result.results.map(
+    p => [
+      {
+        text:
+          `${p.active ? "🟢" : "🔴"} ` +
+          `${p.name} (${p.item_count})`,
+        callback_data:
+          `ap:${p.id}`
+      }
+    ]
+  );
+
+  rows.push([
+    {
+      text: "➕ Thêm Sản Phẩm",
+      callback_data: "admin_add_product"
+    }
+  ]);
+
+  rows.push([
+    {
+      text: "⬅️ Admin Panel",
+      callback_data: "admin"
+    }
+  ]);
+
+  return sendOrEdit(
+    env,
+    chatId,
+    messageId,
+    text,
+    {
+      inline_keyboard: rows
+    }
+  );
+}
+
+
+async function showAdminProduct(
+  env,
+  chatId,
+  messageId,
+  productId
+) {
+  const product = await env.DB
+    .prepare(`
+      SELECT *
+      FROM products
+      WHERE id=?
+    `)
+    .bind(productId)
+    .first();
+
+  if (!product) {
+    return showAdminProducts(
+      env,
+      chatId,
+      messageId
+    );
+  }
+
+  const items = await env.DB
+    .prepare(`
+      SELECT *
+      FROM product_items
+      WHERE product_id=?
+      ORDER BY sort_order
+    `)
+    .bind(productId)
+    .all();
+
+  let text =
+    `📦 <b>${esc(
+      product.name
+    )}</b>\n` +
+    `━━━━━━━━━━━━\n\n` +
+
+    `🆔 ID: <code>${esc(
+      product.id
+    )}</code>\n` +
+
+    `📊 Trạng thái: ${
+      product.active
+        ? "🟢 Đang bán"
+        : "🔴 Đang ẩn"
+    }\n\n` +
+
+    `<b>Danh sách gói:</b>\n`;
+
+  if (!items.results.length) {
+    text +=
+      `Chưa có gói nào.\n`;
+  }
+
+  const rows = [];
+
+  for (const item of items.results) {
+    text +=
+      `• ${esc(item.title)} — ` +
+      `<b>${money(item.price)}</b> — ` +
+      `Kho: <b>${item.stock}</b>\n`;
+
+    rows.push([
+      {
+        text:
+          `⚙️ ${item.title} | ` +
+          `${money(item.price)}`,
+        callback_data:
+          `ai:${item.id}`
+      }
+    ]);
+  }
+
+  rows.push([
+    {
+      text: "➕ Thêm Gói",
+      callback_data:
+        `admin_add_item:${product.id}`
+    }
+  ]);
+
+  rows.push([
+    {
+      text: "✏️ Sửa Tên Sản Phẩm",
+      callback_data:
+        `admin_edit_product:${product.id}`
+    },
+    {
+      text: product.active
+        ? "🔴 Ẩn"
+        : "🟢 Hiện",
+      callback_data:
+        `admin_toggle_product:${product.id}`
+    }
+  ]);
+
+  rows.push([
+    {
+      text: "🗑️ Xóa Sản Phẩm",
+      callback_data:
+        `admin_delete_product:${product.id}`
+    }
+  ]);
+
+  rows.push([
+    {
+      text: "⬅️ Danh Sách",
+      callback_data: "admin_products"
+    }
+  ]);
+
+  return sendOrEdit(
+    env,
+    chatId,
+    messageId,
+    text,
+    {
+      inline_keyboard: rows
+    }
+  );
+}
+
+
+/* =========================================================
+   ADMIN ITEM
+========================================================= */
+
+async function showAdminItem(
+  env,
+  chatId,
+  messageId,
+  itemId
+) {
+  const item = await env.DB
+    .prepare(`
+      SELECT
+        i.*,
+        p.name product_name
+      FROM product_items i
+      JOIN products p
+        ON p.id=i.product_id
+      WHERE i.id=?
+    `)
+    .bind(itemId)
+    .first();
+
+  if (!item) {
+    return showAdminProducts(
+      env,
+      chatId,
+      messageId
+    );
+  }
+
+  const text =
+    `⚙️ <b>QUẢN LÝ GÓI</b>\n` +
+    `━━━━━━━━━━━━\n\n` +
+
+    `📦 Sản phẩm: <b>${esc(
+      item.product_name
+    )}</b>\n` +
+
+    `🏷️ Gói: <b>${esc(
+      item.title
+    )}</b>\n` +
+
+    `💰 Giá: <b>${money(
+      item.price
+    )}</b>\n` +
+
+    `📊 Kho: <b>${item.stock}</b>\n` +
+
+    `🆔 ID: <code>${esc(
+      item.id
+    )}</code>`;
+
+  return sendOrEdit(
+    env,
+    chatId,
+    messageId,
+    text,
+    {
+      inline_keyboard: [
+        [
+          {
+            text: "✏️ Sửa Tên Gói",
+            callback_data:
+              `admin_edit_item_title:${item.id}`
+          }
+        ],
+        [
+          {
+            text: "💰 Sửa Giá",
+            callback_data:
+              `admin_edit_item_price:${item.id}`
+          },
+          {
+            text: "📦 Sửa Kho",
+            callback_data:
+              `admin_edit_item_stock:${item.id}`
+          }
+        ],
+        [
+          {
+            text: "🗑️ Xóa Gói",
+            callback_data:
+              `admin_delete_item:${item.id}`
+          }
+        ],
+        [
+          {
+            text: "⬅️ Quay Lại",
+            callback_data:
+              `ap:${item.product_id}`
+          }
+        ]
+      ]
+    }
+  );
+}
+
+
+/* =========================================================
+   ADMIN DEPOSITS
+========================================================= */
 
 async function showAdminDeposits(
   env,
@@ -403,25 +1037,33 @@ async function showAdminDeposits(
     .all();
 
   let text =
-    `⏳ <b>DANH SÁCH ĐƠN NẠP CHỜ</b>\n` +
+    `⏳ <b>ĐƠN NẠP CHỜ</b>\n` +
     `━━━━━━━━━━━━\n\n`;
 
   if (!result.results.length) {
-    text += "Không có đơn nạp nào đang chờ.";
+    text +=
+      `Không có đơn nào đang chờ.`;
   } else {
-    result.results.forEach((d, i) => {
-      text +=
-        `${i + 1}. 💰 <b>${money(d.amount)}</b>\n` +
-        `👤 User ID: <code>${esc(
-          d.telegram_id
-        )}</code>\n` +
-        `📝 Nội dung: <code>${esc(
-          d.content
-        )}</code>\n` +
-        `🆔 Đơn: <code>${esc(
-          d.id
-        )}</code>\n\n`;
-    });
+    result.results.forEach(
+      (d, i) => {
+        text +=
+          `${i + 1}. 💰 <b>${money(
+            d.amount
+          )}</b>\n` +
+
+          `👤 User: <code>${esc(
+            d.telegram_id
+          )}</code>\n` +
+
+          `📝 Nội dung: <code>${esc(
+            d.content
+          )}</code>\n` +
+
+          `🆔 Đơn: <code>${esc(
+            d.id
+          )}</code>\n\n`;
+      }
+    );
   }
 
   return sendOrEdit(
@@ -433,14 +1075,16 @@ async function showAdminDeposits(
       inline_keyboard: [
         [
           {
-            text: "🔄 Làm mới",
-            callback_data: "admin_deposits"
+            text: "🔄 Làm Mới",
+            callback_data:
+              "admin_deposits"
           }
         ],
         [
           {
             text: "⬅️ Admin Panel",
-            callback_data: "admin"
+            callback_data:
+              "admin"
           }
         ]
       ]
@@ -448,6 +1092,10 @@ async function showAdminDeposits(
   );
 }
 
+
+/* =========================================================
+   ADMIN USERS
+========================================================= */
 
 async function showAdminUsers(
   env,
@@ -468,23 +1116,29 @@ async function showAdminUsers(
     `━━━━━━━━━━━━\n\n`;
 
   if (!result.results.length) {
-    text += "Chưa có user.";
+    text +=
+      `Chưa có user.`;
   } else {
-    result.results.forEach((u, i) => {
-      text +=
-        `${i + 1}. 👤 <b>${esc(
-          u.first_name ||
-          u.username ||
-          "Không rõ"
-        )}</b>\n` +
-        `🆔 <code>${u.telegram_id}</code>\n` +
-        `💳 Số dư: <b>${money(
-          u.balance
-        )}</b>\n` +
-        `💰 Đã nạp: <b>${money(
-          u.total_deposit
-        )}</b>\n\n`;
-    });
+    result.results.forEach(
+      (u, i) => {
+        text +=
+          `${i + 1}. 👤 <b>${esc(
+            u.first_name ||
+            u.username ||
+            "Không rõ"
+          )}</b>\n` +
+
+          `🆔 <code>${u.telegram_id}</code>\n` +
+
+          `💳 Số dư: <b>${money(
+            u.balance
+          )}</b>\n` +
+
+          `💰 Đã nạp: <b>${money(
+            u.total_deposit
+          )}</b>\n\n`;
+      }
+    );
   }
 
   return sendOrEdit(
@@ -496,14 +1150,23 @@ async function showAdminUsers(
       inline_keyboard: [
         [
           {
-            text: "🔄 Làm mới",
-            callback_data: "admin_users"
+            text: "💰 Cộng Tiền User",
+            callback_data:
+              "admin_add_money"
+          }
+        ],
+        [
+          {
+            text: "🔄 Làm Mới",
+            callback_data:
+              "admin_users"
           }
         ],
         [
           {
             text: "⬅️ Admin Panel",
-            callback_data: "admin"
+            callback_data:
+              "admin"
           }
         ]
       ]
@@ -513,7 +1176,7 @@ async function showAdminUsers(
 
 
 /* =========================================================
-   PRODUCTS
+   PRODUCTS USER
 ========================================================= */
 
 async function showProducts(
@@ -526,7 +1189,7 @@ async function showProducts(
       SELECT id,name,emoji
       FROM products
       WHERE active=1
-      ORDER BY sort_order
+      ORDER BY sort_order,name
     `)
     .all();
 
@@ -540,10 +1203,15 @@ async function showProducts(
     rows.push(
       ps.results
         .slice(i, i + 2)
-        .map(p => ({
-          text: `${p.emoji || "📦"} ${p.name}`,
-          callback_data: `p:${p.id}`
-        }))
+        .map(
+          p => ({
+            text:
+              `${p.emoji || "📦"} ` +
+              p.name,
+            callback_data:
+              `p:${p.id}`
+          })
+        )
     );
   }
 
@@ -558,10 +1226,8 @@ async function showProducts(
     env,
     chatId,
     messageId,
-    `🛍️ <b>DANH SÁCH SẢN PHẨM</b>
-
-Chào mừng bạn đến với cửa hàng!
-Vui lòng chọn danh mục bên dưới để xem chi tiết:`,
+    `🛍️ <b>DANH SÁCH SẢN PHẨM</b>\n\n` +
+    `Chọn danh mục bên dưới để xem chi tiết:`,
     {
       inline_keyboard: rows
     }
@@ -576,15 +1242,20 @@ async function showProduct(
   productId
 ) {
   const product = await env.DB
-    .prepare(
-      "SELECT * FROM products WHERE id=?"
-    )
+    .prepare(`
+      SELECT *
+      FROM products
+      WHERE id=?
+        AND active=1
+    `)
     .bind(productId)
     .first();
 
   if (!product) {
-    throw new Error(
-      "Không tìm thấy sản phẩm"
+    return showProducts(
+      env,
+      chatId,
+      messageId
     );
   }
 
@@ -599,20 +1270,30 @@ async function showProduct(
     .all();
 
   const rows =
-    items.results.map(x => [
-      {
-        text: `💎 ${product.name} ${x.title}`,
-        callback_data: `i:${x.id}`
-      },
-      {
-        text: `💰 ${money(x.price)}`,
-        callback_data: "noop"
-      },
-      {
-        text: `📦 Kho: ${x.stock}`,
-        callback_data: "noop"
-      }
-    ]);
+    items.results.map(
+      x => [
+        {
+          text:
+            `💎 ${x.title}`,
+          callback_data:
+            `i:${x.id}`
+        },
+        {
+          text:
+            `💰 ${money(
+              x.price
+            )}`,
+          callback_data:
+            "noop"
+        },
+        {
+          text:
+            `📦 ${x.stock}`,
+          callback_data:
+            "noop"
+        }
+      ]
+    );
 
   rows.push([
     {
@@ -625,12 +1306,11 @@ async function showProduct(
     env,
     chatId,
     messageId,
-    `📁 <b>Mục: ${esc(
+    `📁 <b>${esc(
       product.name
-    )}</b>
+    )}</b>\n\n` +
 
-Chọn mục muốn mua.
-Giá và số lượng còn trong kho được hiển thị bên cạnh.`,
+    `Chọn gói muốn mua.`,
     {
       inline_keyboard: rows
     }
@@ -653,27 +1333,36 @@ async function showItem(
       JOIN products p
         ON p.id=i.product_id
       WHERE i.id=?
+        AND p.active=1
     `)
     .bind(itemId)
     .first();
 
   if (!row) {
-    throw new Error(
-      "Không tìm thấy mục"
+    return showProducts(
+      env,
+      chatId,
+      messageId
     );
   }
 
   const text =
     `📦 <b>THÔNG TIN SẢN PHẨM</b>\n` +
     `━━━━━━━━━━━━\n\n` +
+
     `🏷️ Tên: <b>${esc(
       row.product_name
-    )} ${esc(row.title)}</b>\n` +
+    )} ${esc(
+      row.title
+    )}</b>\n` +
+
     `💰 Giá: <b>${money(
       row.price
     )}</b>\n` +
-    `📊 Số lượng trong kho: <b>${row.stock}</b>\n\n` +
-    `👇 Chọn nút bên dưới để mua sản phẩm.`;
+
+    `📊 Trong kho: <b>${row.stock}</b>\n\n` +
+
+    `👇 Chọn MUA NGAY để thanh toán.`;
 
   return sendOrEdit(
     env,
@@ -685,13 +1374,15 @@ async function showItem(
         [
           {
             text: "🛒 MUA NGAY",
-            callback_data: `confirm:${itemId}`
+            callback_data:
+              `confirm:${itemId}`
           }
         ],
         [
           {
             text: "⬅️ Quay Lại",
-            callback_data: `p:${row.product_id}`
+            callback_data:
+              `p:${row.product_id}`
           }
         ]
       ]
@@ -711,56 +1402,71 @@ async function buyItem(
   userId,
   itemId
 ) {
-  const result = await env.DB.batch([
-    env.DB
-      .prepare(
-        "SELECT balance FROM users WHERE telegram_id=?"
-      )
-      .bind(String(userId)),
+  const item = await env.DB
+    .prepare(`
+      SELECT
+        i.*,
+        p.name product_name,
+        p.active
+      FROM product_items i
+      JOIN products p
+        ON p.id=i.product_id
+      WHERE i.id=?
+    `)
+    .bind(itemId)
+    .first();
 
-    env.DB
-      .prepare(`
-        SELECT
-          i.*,
-          p.name product_name
-        FROM product_items i
-        JOIN products p
-          ON p.id=i.product_id
-        WHERE i.id=?
-      `)
-      .bind(itemId)
-  ]);
-
-  const user =
-    result[0].results[0];
-
-  const item =
-    result[1].results[0];
-
-  if (!user || !item) {
-    throw new Error(
-      "Dữ liệu không tồn tại"
-    );
-  }
-
-  if (item.stock <= 0) {
+  if (!item || !item.active) {
     return sendOrEdit(
       env,
       chatId,
       messageId,
-      `❌ <b>SẢN PHẨM ĐÃ HẾT HÀNG</b>
+      `❌ Sản phẩm không còn khả dụng.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text: "🛍️ Xem Sản Phẩm",
+              callback_data: "buy"
+            }
+          ]
+        ]
+      }
+    );
+  }
 
-Vui lòng chọn sản phẩm khác.`,
+  if (Number(item.stock) <= 0) {
+    return sendOrEdit(
+      env,
+      chatId,
+      messageId,
+      `❌ <b>SẢN PHẨM ĐÃ HẾT HÀNG</b>`,
       {
         inline_keyboard: [
           [
             {
               text: "⬅️ Quay Lại",
-              callback_data: `p:${item.product_id}`
+              callback_data:
+                `p:${item.product_id}`
             }
           ]
         ]
       }
+    );
+  }
+
+  const user = await env.DB
+    .prepare(`
+      SELECT balance
+      FROM users
+      WHERE telegram_id=?
+    `)
+    .bind(String(userId))
+    .first();
+
+  if (!user) {
+    throw new Error(
+      "Không tìm thấy user"
     );
   }
 
@@ -776,15 +1482,17 @@ Vui lòng chọn sản phẩm khác.`,
       env,
       chatId,
       messageId,
-      `❌ <b>SỐ DƯ KHÔNG ĐỦ</b>
+      `❌ <b>SỐ DƯ KHÔNG ĐỦ</b>\n\n` +
 
-💳 Số dư hiện tại: <b>${money(
+      `💳 Số dư: <b>${money(
         user.balance
-      )}</b>
-💰 Giá sản phẩm: <b>${money(
+      )}</b>\n` +
+
+      `💰 Giá: <b>${money(
         item.price
-      )}</b>
-➖ Vui lòng nạp thêm: <b>${money(
+      )}</b>\n` +
+
+      `➖ Cần nạp thêm: <b>${money(
         missing
       )}</b>`,
       {
@@ -792,13 +1500,15 @@ Vui lòng chọn sản phẩm khác.`,
           [
             {
               text: "💳 Nạp Tiền",
-              callback_data: "deposit"
+              callback_data:
+                "deposit"
             }
           ],
           [
             {
               text: "⬅️ Quay Lại",
-              callback_data: `i:${itemId}`
+              callback_data:
+                `i:${itemId}`
             }
           ]
         ]
@@ -809,86 +1519,106 @@ Vui lòng chọn sản phẩm khác.`,
   const orderId =
     rid("ORD");
 
-  const out =
-    await env.DB.batch([
-      env.DB
-        .prepare(`
-          UPDATE users
-          SET
-            balance=balance-?,
-            total_spent=total_spent+?
-          WHERE
-            telegram_id=?
-            AND balance>=?
-        `)
-        .bind(
-          item.price,
-          item.price,
-          String(userId),
-          item.price
-        ),
+  /*
+    Trừ tiền và trừ kho có điều kiện.
+    Nếu một trong hai thay đổi thất bại,
+    hoàn lại phần đã thay đổi.
+  */
 
-      env.DB
-        .prepare(`
-          UPDATE product_items
-          SET stock=stock-1
-          WHERE
-            id=?
-            AND stock>0
-        `)
-        .bind(itemId)
-    ]);
+  const out = await env.DB.batch([
+    env.DB
+      .prepare(`
+        UPDATE users
+        SET
+          balance=balance-?,
+          total_spent=total_spent+?
+        WHERE
+          telegram_id=?
+          AND balance>=?
+      `)
+      .bind(
+        item.price,
+        item.price,
+        String(userId),
+        item.price
+      ),
+
+    env.DB
+      .prepare(`
+        UPDATE product_items
+        SET stock=stock-1
+        WHERE
+          id=?
+          AND stock>0
+      `)
+      .bind(itemId)
+  ]);
+
+  const userChanged =
+    Number(
+      out[0]?.meta?.changes || 0
+    );
+
+  const stockChanged =
+    Number(
+      out[1]?.meta?.changes || 0
+    );
 
   if (
-    out[0].meta.changes !== 1 ||
-    out[1].meta.changes !== 1
+    userChanged !== 1 ||
+    stockChanged !== 1
   ) {
-    if (
-      out[0].meta.changes === 1 &&
-      out[1].meta.changes !== 1
-    ) {
-      await env.DB
-        .prepare(`
-          UPDATE users
-          SET
-            balance=balance+?,
-            total_spent=total_spent-?
-          WHERE telegram_id=?
-        `)
-        .bind(
-          item.price,
-          item.price,
-          String(userId)
-        )
-        .run();
+    const rollback = [];
+
+    if (userChanged === 1) {
+      rollback.push(
+        env.DB
+          .prepare(`
+            UPDATE users
+            SET
+              balance=balance+?,
+              total_spent=total_spent-?
+            WHERE telegram_id=?
+          `)
+          .bind(
+            item.price,
+            item.price,
+            String(userId)
+          )
+      );
     }
 
-    if (
-      out[1].meta.changes === 1 &&
-      out[0].meta.changes !== 1
-    ) {
-      await env.DB
-        .prepare(`
-          UPDATE product_items
-          SET stock=stock+1
-          WHERE id=?
-        `)
-        .bind(itemId)
-        .run();
+    if (stockChanged === 1) {
+      rollback.push(
+        env.DB
+          .prepare(`
+            UPDATE product_items
+            SET stock=stock+1
+            WHERE id=?
+          `)
+          .bind(itemId)
+      );
+    }
+
+    if (rollback.length) {
+      await env.DB.batch(
+        rollback
+      );
     }
 
     return sendOrEdit(
       env,
       chatId,
       messageId,
-      `⚠️ Số dư hoặc kho vừa thay đổi.
-Vui lòng thử lại.`,
+      `⚠️ Số dư hoặc kho vừa thay đổi.\n\n` +
+      `Vui lòng thử lại.`,
       {
         inline_keyboard: [
           [
             {
-              text: "🔄 Xem lại",
-              callback_data: `i:${itemId}`
+              text: "🔄 Xem Lại",
+              callback_data:
+                `i:${itemId}`
             }
           ]
         ]
@@ -896,57 +1626,71 @@ Vui lòng thử lại.`,
     );
   }
 
-  await env.DB
-    .prepare(`
-      INSERT INTO purchases(
-        id,
-        telegram_id,
-        product_item_id,
-        product_name,
-        item_title,
-        price
+  try {
+    await env.DB
+      .prepare(`
+        INSERT INTO purchases(
+          id,
+          telegram_id,
+          product_item_id,
+          product_name,
+          item_title,
+          price
+        )
+        VALUES(?,?,?,?,?,?)
+      `)
+      .bind(
+        orderId,
+        String(userId),
+        itemId,
+        item.product_name,
+        item.title,
+        item.price
       )
-      VALUES(?,?,?,?,?,?)
-    `)
-    .bind(
-      orderId,
-      String(userId),
-      itemId,
-      item.product_name,
-      item.title,
-      item.price
-    )
-    .run();
+      .run();
+
+  } catch (e) {
+    console.error(
+      "purchase insert",
+      e
+    );
+  }
 
   return sendOrEdit(
     env,
     chatId,
     messageId,
-    `✅ <b>MUA HÀNG THÀNH CÔNG</b>
+    `✅ <b>MUA HÀNG THÀNH CÔNG</b>\n\n` +
 
-📦 Sản phẩm: <b>${esc(
+    `📦 Sản phẩm: <b>${esc(
       item.product_name
-    )} ${esc(item.title)}</b>
-💰 Đã thanh toán: <b>${money(
-      item.price
-    )}</b>
-🧾 Mã đơn: <code>${orderId}</code>
+    )} ${esc(
+      item.title
+    )}</b>\n` +
 
-📩 <b>Vui lòng ib Admin ${esc(
-      env.ADMIN_USERNAME
-    )} để lấy key.</b>`,
+    `💰 Đã thanh toán: <b>${money(
+      item.price
+    )}</b>\n` +
+
+    `🧾 Mã đơn: <code>${orderId}</code>\n\n` +
+
+    `📩 <b>Liên hệ Admin ${esc(
+      env.ADMIN_USERNAME || ""
+    )} để nhận key.</b>`,
     {
       inline_keyboard: [
         [
           {
             text: "🛍️ Mua Thêm",
-            callback_data: "buy"
+            callback_data:
+              "buy"
           }
         ],
         [
           {
             text: "🏠 Trang Chủ",
-            callback_data: "home"
+            callback_data:
+              "home"
           }
         ]
       ]
@@ -993,7 +1737,7 @@ async function promptDeposit(
       0,
       "INPUT",
       "INPUT",
-      addMin(5)
+      addMin(10)
     )
     .run();
 
@@ -1001,21 +1745,22 @@ async function promptDeposit(
     env,
     chatId,
     messageId,
-    `💳 <b>NẠP TIỀN</b>
+    `💳 <b>NẠP TIỀN</b>\n\n` +
 
-Nhập số tiền bạn muốn nạp.
+    `Nhập số tiền muốn nạp.\n\n` +
 
-💰 Tối thiểu: <b>${money(
+    `💰 Tối thiểu: <b>${money(
       env.MIN_DEPOSIT || 10000
-    )}</b>
+    )}</b>\n\n` +
 
-Ví dụ: <code>50000</code>`,
+    `Ví dụ: <code>50000</code>`,
     {
       inline_keyboard: [
         [
           {
             text: "⬅️ Hủy",
-            callback_data: "home"
+            callback_data:
+              "home"
           }
         ]
       ]
@@ -1028,36 +1773,13 @@ async function createDeposit(
   env,
   message
 ) {
-  const amount = Number(
-    String(
-      message.text || ""
-    ).replace(/[^\d]/g, "")
-  );
-
-  const min = Number(
-    env.MIN_DEPOSIT || 10000
-  );
-
-  if (
-    !Number.isSafeInteger(amount) ||
-    amount < min
-  ) {
-    return tg(
-      env,
-      "sendMessage",
-      {
-        chat_id: message.chat.id,
-        text:
-          `❌ Số tiền không hợp lệ.\n\n` +
-          `Số tiền nạp tối thiểu là ` +
-          `<b>${money(min)}</b>.`,
-        parse_mode: "HTML"
-      }
-    );
-  }
-
   const uid =
     String(message.from.id);
+
+  /*
+    Chỉ xử lý nếu user thực sự
+    đang ở trạng thái INPUT.
+  */
 
   const input = await env.DB
     .prepare(`
@@ -1076,7 +1798,58 @@ async function createDeposit(
     return false;
   }
 
-  const id = rid("NAP");
+  if (
+    Date.parse(
+      input.expires_at
+    ) < Date.now()
+  ) {
+    await env.DB
+      .prepare(`
+        UPDATE deposits
+        SET status='EXPIRED'
+        WHERE id=?
+      `)
+      .bind(input.id)
+      .run();
+
+    return false;
+  }
+
+  const amount =
+    parseMoney(message.text);
+
+  const min =
+    Number(
+      env.MIN_DEPOSIT || 10000
+    );
+
+  if (
+    !Number.isSafeInteger(amount) ||
+    amount < min
+  ) {
+    await tg(
+      env,
+      "sendMessage",
+      {
+        chat_id:
+          message.chat.id,
+
+        text:
+          `❌ Số tiền không hợp lệ.\n\n` +
+          `Tối thiểu: <b>${money(
+            min
+          )}</b>\n\n` +
+          `Nhập lại số tiền:`,
+
+        parse_mode: "HTML"
+      }
+    );
+
+    return true;
+  }
+
+  const id =
+    rid("NAP");
 
   const content =
     `NAP${crypto.randomUUID()
@@ -1114,10 +1887,13 @@ async function createDeposit(
     `MB-${encodeURIComponent(
       env.MB_BANK_ACCOUNT
     )}-compact2.png` +
+
     `?amount=${amount}` +
+
     `&addInfo=${encodeURIComponent(
       content
     )}` +
+
     `&accountName=${encodeURIComponent(
       env.BANK_ACCOUNT_NAME || ""
     )}`;
@@ -1126,27 +1902,34 @@ async function createDeposit(
     env,
     "sendPhoto",
     {
-      chat_id: message.chat.id,
+      chat_id:
+        message.chat.id,
+
       photo: qr,
 
       caption:
         `💳 <b>HÓA ĐƠN NẠP TIỀN</b>\n` +
         `━━━━━━━━━━━━\n\n` +
+
         `🏦 Ngân hàng: <b>${esc(
-          env.BANK_NAME
+          env.BANK_NAME || "MB Bank"
         )}</b>\n` +
+
         `💳 STK: <code>${esc(
           env.MB_BANK_ACCOUNT
         )}</code>\n` +
+
         `👤 Chủ TK: <b>${esc(
           env.BANK_ACCOUNT_NAME
         )}</b>\n` +
+
         `💰 Số tiền: <b>${money(
           amount
         )}</b>\n` +
+
         `📝 Nội dung: <code>${content}</code>\n\n` +
-        `⚠️ <b>Chuyển đúng số tiền và nội dung.</b>\n` +
-        `📩 <i>Nếu sau 15 phút tiền không vào, ib Admin nhé.</i>`,
+
+        `⚠️ <b>Chuyển đúng số tiền và nội dung.</b>`,
 
       parse_mode: "HTML",
 
@@ -1154,14 +1937,18 @@ async function createDeposit(
         inline_keyboard: [
           [
             {
-              text: "🔄 Kiểm Tra Thanh Toán",
-              callback_data: `check:${id}`
+              text:
+                "🔄 Kiểm Tra Thanh Toán",
+              callback_data:
+                `check:${id}`
             }
           ],
           [
             {
-              text: "⬅️ Trang Chủ",
-              callback_data: "home"
+              text:
+                "⬅️ Trang Chủ",
+              callback_data:
+                "home"
             }
           ]
         ]
@@ -1187,40 +1974,41 @@ async function showProfile(
     `https://t.me/${env.BOT_USERNAME ||
       "YOUR_BOT"}?start=ref_${user.telegram_id}`;
 
-  const text =
+  return sendOrEdit(
+    env,
+    chatId,
+    messageId,
     `💎 <b>THÔNG TIN CÁ NHÂN</b>\n` +
     `━━━━━━━━━━━━\n\n` +
+
     `🆔 ID: <code>${user.telegram_id}</code>\n` +
     `👤 Tên: <b>${esc(
       user.first_name ||
       user.username ||
       "Không rõ"
     )}</b>\n` +
+
     `💳 Số dư: <b>${money(
       user.balance
     )}</b>\n` +
-    `💰 Tổng tiền nạp: <b>${money(
+
+    `💰 Tổng nạp: <b>${money(
       user.total_deposit
     )}</b>\n` +
-    `📊 <b>Thống kê</b>\n` +
-    `💸 Tổng chi tiêu: <b>${money(
-      user.total_spent
-    )}</b>\n` +
-    `🔗 Link giới thiệu: <code>${esc(
-      ref
-    )}</code>`;
 
-  return sendOrEdit(
-    env,
-    chatId,
-    messageId,
-    text,
+    `💸 Tổng chi: <b>${money(
+      user.total_spent
+    )}</b>\n\n` +
+
+    `🔗 Link giới thiệu:\n` +
+    `<code>${esc(ref)}</code>`,
     {
       inline_keyboard: [
         [
           {
             text: "⬅️ Trang Chủ",
-            callback_data: "home"
+            callback_data:
+              "home"
           }
         ]
       ]
@@ -1239,8 +2027,8 @@ async function showTop(
   messageId,
   userId
 ) {
-  const top = await env.DB
-    .prepare(`
+  const result = await env.DB.batch([
+    env.DB.prepare(`
       SELECT
         telegram_id,
         username,
@@ -1250,59 +2038,84 @@ async function showTop(
       WHERE total_deposit>0
       ORDER BY total_deposit DESC
       LIMIT 10
-    `)
-    .all();
+    `),
 
-  const rank = await env.DB
-    .prepare(`
-      SELECT COUNT(*)+1 rank
-      FROM users
-      WHERE total_deposit>(
-        SELECT total_deposit
+    env.DB
+      .prepare(`
+        SELECT
+          total_deposit
         FROM users
         WHERE telegram_id=?
-      )
-    `)
-    .bind(String(userId))
-    .first();
+      `)
+      .bind(String(userId))
+  ]);
 
-  let lines =
+  const top =
+    result[0].results;
+
+  const me =
+    result[1].results[0];
+
+  let rank =
+    "Chưa xếp hạng";
+
+  if (
+    me &&
+    Number(me.total_deposit) > 0
+  ) {
+    const r = await env.DB
+      .prepare(`
+        SELECT COUNT(*)+1 AS rank
+        FROM users
+        WHERE total_deposit>?
+      `)
+      .bind(me.total_deposit)
+      .first();
+
+    rank =
+      `Top ${r.rank}`;
+  }
+
+  let text =
     `🏆 <b>TOP NẠP</b>\n` +
     `━━━━━━━━━━━━\n\n`;
 
-  if (!top.results.length) {
-    lines +=
-      "Chưa có dữ liệu nạp tiền.\n";
+  if (!top.length) {
+    text +=
+      `Chưa có dữ liệu.`;
   } else {
-    top.results.forEach((u, i) => {
-      lines +=
-        `<b>Top ${i + 1}</b> — ` +
-        `${esc(
-          u.first_name ||
-          u.username ||
-          u.telegram_id
-        )}: ` +
-        `<b>${money(
-          u.total_deposit
-        )}</b>\n`;
-    });
+    top.forEach(
+      (u, i) => {
+        text +=
+          `<b>Top ${i + 1}</b> — ` +
+          `${esc(
+            u.first_name ||
+            u.username ||
+            u.telegram_id
+          )}: ` +
+
+          `<b>${money(
+            u.total_deposit
+          )}</b>\n`;
+      }
+    );
   }
 
-  lines +=
-    `\n📊 <b>Xếp hạng của bạn:</b> ` +
-    `Top ${rank?.rank || "Chưa xếp hạng"}`;
+  text +=
+    `\n📊 Xếp hạng của bạn: <b>${rank}</b>`;
 
   return sendOrEdit(
     env,
     chatId,
     messageId,
-    lines,
+    text,
     {
       inline_keyboard: [
         [
           {
             text: "⬅️ Trang Chủ",
-            callback_data: "home"
+            callback_data:
+              "home"
           }
         ]
       ]
@@ -1340,35 +2153,39 @@ async function showHistory(
 
   if (!ds.results.length) {
     text +=
-      "Chưa có giao dịch nạp thành công.";
+      `Chưa có giao dịch nạp thành công.`;
   } else {
-    ds.results.forEach(d => {
-      const time =
-        new Date(
-          d.paid_at ||
-          d.created_at
-        ).toLocaleString(
-          "vi-VN",
-          {
-            timeZone: "Asia/Ho_Chi_Minh"
-          }
-        );
+    ds.results.forEach(
+      d => {
+        const time =
+          new Date(
+            d.paid_at ||
+            d.created_at
+          ).toLocaleString(
+            "vi-VN",
+            {
+              timeZone:
+                "Asia/Ho_Chi_Minh"
+            }
+          );
 
-      text +=
-        `💰 Đã cộng: <b>${money(
-          d.amount
-        )}</b>\n` +
-        `📝 Nội dung: <code>${esc(
-          d.content
-        )}</code>\n` +
-        `🔖 Mã giao dịch: <code>${esc(
-          d.bank_transaction_id ||
-          d.id
-        )}</code>\n` +
-        `🕒 Thời gian: ${esc(
-          time
-        )}\n\n`;
-    });
+        text +=
+          `💰 Đã cộng: <b>${money(
+            d.amount
+          )}</b>\n` +
+
+          `📝 Nội dung: <code>${esc(
+            d.content
+          )}</code>\n` +
+
+          `🔖 Mã GD: <code>${esc(
+            d.bank_transaction_id ||
+            d.id
+          )}</code>\n` +
+
+          `🕒 ${esc(time)}\n\n`;
+      }
+    );
   }
 
   return sendOrEdit(
@@ -1381,7 +2198,8 @@ async function showHistory(
         [
           {
             text: "⬅️ Trang Chủ",
-            callback_data: "home"
+            callback_data:
+              "home"
           }
         ]
       ]
@@ -1403,27 +2221,28 @@ async function showSupport(
     env,
     chatId,
     messageId,
-    `🔐 <b>HỖ TRỢ</b>
-━━━━━━━━━━━━
+    `🔐 <b>HỖ TRỢ</b>\n` +
+    `━━━━━━━━━━━━\n\n` +
 
-📌 Hướng dẫn:
-1. Chọn chức năng cần dùng.
-2. Khi nạp tiền, chuyển đúng số tiền và nội dung.
-3. Sau khi giao dịch thành công hệ thống sẽ tự cộng số dư.
-4. Nếu sau 15 phút tiền không vào thì ib Admin nhé.
+    `1. Chọn chức năng cần dùng.\n` +
+    `2. Nạp đúng số tiền và nội dung.\n` +
+    `3. Hệ thống tự kiểm tra giao dịch.\n` +
+    `4. Nếu chưa nhận tiền, liên hệ Admin.\n\n` +
 
-👤 Admin: ${esc(
-      env.ADMIN_USERNAME
-    )}
+    `👤 Admin: ${esc(
+      env.ADMIN_USERNAME || ""
+    )}\n\n` +
 
-${esc(
+    `${esc(
       env.SUPPORT_TEXT || ""
     )}`,
     {
       inline_keyboard: [
         [
           {
-            text: "💬 Liên Hệ Admin",
+            text:
+              "💬 Liên Hệ Admin",
+
             url:
               `https://t.me/${String(
                 env.ADMIN_USERNAME || ""
@@ -1433,7 +2252,8 @@ ${esc(
         [
           {
             text: "⬅️ Trang Chủ",
-            callback_data: "home"
+            callback_data:
+              "home"
           }
         ]
       ]
@@ -1446,12 +2266,9 @@ ${esc(
    MB AUTH
 ========================================================= */
 
-let tokenCache = {
-  value: null,
-  expires: 0
-};
-
-async function getMbAccessToken(env) {
+async function getMbAccessToken(
+  env
+) {
   if (
     tokenCache.value &&
     tokenCache.expires >
@@ -1484,28 +2301,33 @@ async function getMbAccessToken(env) {
     env.MB_TOKEN_URL,
     {
       method: "POST",
+
       headers: {
-        "Authorization":
+        Authorization:
           `Basic ${basic}`,
+
         "Content-Type":
           "application/x-www-form-urlencoded",
-        "Accept":
+
+        Accept:
           "application/json"
       },
-      body: body.toString()
+
+      body:
+        body.toString()
     }
   );
 
-  const j = await r
-    .json()
-    .catch(() => ({}));
+  const j =
+    await r.json()
+      .catch(() => ({}));
 
   if (
     !r.ok ||
     !j.access_token
   ) {
     throw new Error(
-      `Không lấy được MB access token: ${
+      `Không lấy được MB token: ${
         j.message ||
         j.error ||
         r.status
@@ -1514,7 +2336,9 @@ async function getMbAccessToken(env) {
   }
 
   tokenCache = {
-    value: j.access_token,
+    value:
+      j.access_token,
+
     expires:
       Date.now() +
       Math.max(
@@ -1522,15 +2346,16 @@ async function getMbAccessToken(env) {
         Number(
           j.expires_in
         ) || 300
-      ) *
-        1000
+      ) * 1000
   };
 
   return tokenCache.value;
 }
 
 
-async function getMbTransactions(env) {
+async function getMbTransactions(
+  env
+) {
   if (!env.MB_TRANSACTION_URL) {
     throw new Error(
       "MB_TRANSACTION_URL chưa được cấu hình"
@@ -1541,8 +2366,10 @@ async function getMbTransactions(env) {
     await getMbAccessToken(env);
 
   const method =
-    env.MB_TRANSACTION_METHOD ||
-    "GET";
+    String(
+      env.MB_TRANSACTION_METHOD ||
+      "GET"
+    ).toUpperCase();
 
   const r = await fetch(
     env.MB_TRANSACTION_URL,
@@ -1550,10 +2377,12 @@ async function getMbTransactions(env) {
       method,
 
       headers: {
-        "Authorization":
+        Authorization:
           `Bearer ${token}`,
-        "Accept":
+
+        Accept:
           "application/json",
+
         "Content-Type":
           "application/json"
       },
@@ -1570,7 +2399,7 @@ async function getMbTransactions(env) {
 
   if (!r.ok) {
     throw new Error(
-      `MB transaction API ${r.status}: ${text.slice(
+      `MB API ${r.status}: ${text.slice(
         0,
         300
       )}`
@@ -1587,7 +2416,9 @@ async function getMbTransactions(env) {
 }
 
 
-function flattenTransactions(data) {
+function flattenTransactions(
+  data
+) {
   if (Array.isArray(data)) {
     return data;
   }
@@ -1654,9 +2485,11 @@ async function checkDeposit(
   depositId
 ) {
   const d = await env.DB
-    .prepare(
-      "SELECT * FROM deposits WHERE id=?"
-    )
+    .prepare(`
+      SELECT *
+      FROM deposits
+      WHERE id=?
+    `)
     .bind(depositId)
     .first();
 
@@ -1670,13 +2503,15 @@ async function checkDeposit(
   if (
     Date.parse(
       d.expires_at
-    ) < Date.now()
+    ) <= Date.now()
   ) {
     await env.DB
       .prepare(`
         UPDATE deposits
         SET status='EXPIRED'
-        WHERE id=?
+        WHERE
+          id=?
+          AND status='PENDING'
       `)
       .bind(d.id)
       .run();
@@ -1691,10 +2526,13 @@ async function checkDeposit(
     await getMbTransactions(env);
 
   const match =
-    flattenTransactions(data).find(
+    flattenTransactions(
+      data
+    ).find(
       tx =>
         txAmount(tx) ===
           Number(d.amount) &&
+
         txContent(tx).includes(
           String(
             d.content
@@ -1709,6 +2547,12 @@ async function checkDeposit(
   const transactionId =
     txId(match) ||
     rid("MB");
+
+  /*
+    Claim đơn trước.
+    Chỉ request nào update thành công
+    mới được cộng tiền.
+  */
 
   const claim = await env.DB
     .prepare(`
@@ -1734,36 +2578,41 @@ async function checkDeposit(
     .run();
 
   if (
-    claim.meta.changes !== 1
+    Number(
+      claim.meta.changes
+    ) !== 1
   ) {
-    return await env.DB
-      .prepare(
-        "SELECT * FROM deposits WHERE id=?"
-      )
+    return env.DB
+      .prepare(`
+        SELECT *
+        FROM deposits
+        WHERE id=?
+      `)
       .bind(d.id)
       .first();
   }
 
-  await env.DB.batch([
-    env.DB
-      .prepare(`
-        UPDATE users
-        SET
-          balance=balance+?,
-          total_deposit=total_deposit+?
-        WHERE telegram_id=?
-      `)
-      .bind(
-        d.amount,
-        d.amount,
-        d.telegram_id
-      )
-  ]);
-
-  return await env.DB
-    .prepare(
-      "SELECT * FROM deposits WHERE id=?"
+  await env.DB
+    .prepare(`
+      UPDATE users
+      SET
+        balance=balance+?,
+        total_deposit=total_deposit+?
+      WHERE telegram_id=?
+    `)
+    .bind(
+      d.amount,
+      d.amount,
+      d.telegram_id
     )
+    .run();
+
+  return env.DB
+    .prepare(`
+      SELECT *
+      FROM deposits
+      WHERE id=?
+    `)
     .bind(d.id)
     .first();
 }
@@ -1773,43 +2622,1090 @@ async function notifyPaid(
   env,
   d
 ) {
-  const user = await env.DB
-    .prepare(
-      "SELECT * FROM users WHERE telegram_id=?"
-    )
+  /*
+    Chống gửi notification trùng.
+  */
+
+  const claim = await env.DB
+    .prepare(`
+      UPDATE deposits
+      SET notified_at=?
+      WHERE
+        id=?
+        AND (
+          notified_at IS NULL
+          OR notified_at=''
+        )
+    `)
     .bind(
-      d.telegram_id
+      nowISO(),
+      d.id
     )
+    .run();
+
+  if (
+    Number(
+      claim.meta.changes
+    ) !== 1
+  ) {
+    return;
+  }
+
+  const user = await env.DB
+    .prepare(`
+      SELECT *
+      FROM users
+      WHERE telegram_id=?
+    `)
+    .bind(d.telegram_id)
     .first();
 
-  if (!user) return;
+  if (!user) {
+    return;
+  }
 
-  await tg(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        d.telegram_id,
+  try {
+    await tg(
+      env,
+      "sendMessage",
+      {
+        chat_id:
+          d.telegram_id,
 
-      parse_mode:
-        "HTML",
+        parse_mode:
+          "HTML",
 
-      text:
-        `✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n\n` +
-        `💰 Đã cộng: <b>${money(
-          d.amount
-        )}</b>\n` +
-        `📝 Nội dung: <code>${esc(
-          d.content
-        )}</code>\n` +
-        `🔖 Mã giao dịch: <code>${esc(
-          d.bank_transaction_id
-        )}</code>\n` +
-        `💳 Số dư mới: <b>${money(
-          user.balance
-        )}</b>`
+        text:
+          `✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n\n` +
+
+          `💰 Đã cộng: <b>${money(
+            d.amount
+          )}</b>\n` +
+
+          `📝 Nội dung: <code>${esc(
+            d.content
+          )}</code>\n` +
+
+          `🔖 Mã giao dịch: <code>${esc(
+            d.bank_transaction_id
+          )}</code>\n` +
+
+          `💳 Số dư mới: <b>${money(
+            user.balance
+          )}</b>`
+      }
+    );
+
+  } catch (e) {
+    /*
+      Reset để cron lần sau
+      có thể gửi lại.
+    */
+
+    await env.DB
+      .prepare(`
+        UPDATE deposits
+        SET notified_at=NULL
+        WHERE id=?
+      `)
+      .bind(d.id)
+      .run();
+
+    throw e;
+  }
+}
+
+
+/* =========================================================
+   ADMIN MESSAGE HANDLER
+========================================================= */
+
+async function handleAdminMessage(
+  env,
+  message
+) {
+  if (!isAdmin(message.from.id)) {
+    return false;
+  }
+
+  const state =
+    await getAdminState(
+      env,
+      message.from.id
+    );
+
+  if (!state) {
+    return false;
+  }
+
+  const text =
+    String(
+      message.text || ""
+    ).trim();
+
+  if (!text) {
+    return true;
+  }
+
+  const chatId =
+    message.chat.id;
+
+  const userId =
+    message.from.id;
+
+  /*
+    CANCEL
+  */
+
+  if (
+    text.toLowerCase() === "/cancel" ||
+    text.toLowerCase() === "hủy" ||
+    text.toLowerCase() === "huy"
+  ) {
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    await sendOrEdit(
+      env,
+      chatId,
+      null,
+      `❌ Đã hủy thao tác.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "🛠️ Admin Panel",
+              callback_data:
+                "admin"
+            }
+          ]
+        ]
+      }
+    );
+
+    return true;
+  }
+
+
+  /*
+    ADD PRODUCT
+  */
+
+  if (
+    state.action ===
+    "ADD_PRODUCT_NAME"
+  ) {
+    if (
+      text.length < 2 ||
+      text.length > 100
+    ) {
+      await tg(
+        env,
+        "sendMessage",
+        {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `❌ Tên sản phẩm phải từ 2 đến 100 ký tự.\n` +
+            `Nhập lại hoặc /cancel`
+        }
+      );
+
+      return true;
     }
-  );
+
+    await setAdminState(
+      env,
+      userId,
+      "ADD_PRODUCT_ID",
+      {
+        name: text
+      }
+    );
+
+    await tg(
+      env,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          `📦 Tên: <b>${esc(
+            text
+          )}</b>\n\n` +
+
+          `Bây giờ nhập <b>ID sản phẩm</b>.\n\n` +
+
+          `Ví dụ: <code>${slugify(
+            text
+          )}</code>\n\n` +
+
+          `ID chỉ gồm chữ, số và dấu -.`
+      }
+    );
+
+    return true;
+  }
+
+
+  if (
+    state.action ===
+    "ADD_PRODUCT_ID"
+  ) {
+    const id =
+      slugify(text);
+
+    const exists = await env.DB
+      .prepare(`
+        SELECT id
+        FROM products
+        WHERE id=?
+      `)
+      .bind(id)
+      .first();
+
+    if (exists) {
+      await tg(
+        env,
+        "sendMessage",
+        {
+          chat_id: chatId,
+          text:
+            `❌ ID này đã tồn tại.\n` +
+            `Nhập ID khác hoặc /cancel`
+        }
+      );
+
+      return true;
+    }
+
+    const max = await env.DB
+      .prepare(`
+        SELECT
+          COALESCE(
+            MAX(sort_order),
+            0
+          ) AS max_sort
+        FROM products
+      `)
+      .first();
+
+    await env.DB
+      .prepare(`
+        INSERT INTO products(
+          id,
+          name,
+          sort_order,
+          active
+        )
+        VALUES(?,?,?,1)
+      `)
+      .bind(
+        id,
+        state.payload.name,
+        Number(max.max_sort || 0) + 1
+      )
+      .run();
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    await sendOrEdit(
+      env,
+      chatId,
+      null,
+      `✅ <b>ĐÃ THÊM SẢN PHẨM</b>\n\n` +
+
+      `📦 ${esc(
+        state.payload.name
+      )}\n` +
+
+      `🆔 <code>${id}</code>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "➕ Thêm Gói",
+              callback_data:
+                `admin_add_item:${id}`
+            }
+          ],
+          [
+            {
+              text:
+                "⚙️ Quản Lý",
+              callback_data:
+                `ap:${id}`
+            }
+          ]
+        ]
+      }
+    );
+
+    return true;
+  }
+
+
+  /*
+    EDIT PRODUCT NAME
+  */
+
+  if (
+    state.action ===
+    "EDIT_PRODUCT_NAME"
+  ) {
+    if (
+      text.length < 2 ||
+      text.length > 100
+    ) {
+      return true;
+    }
+
+    await env.DB
+      .prepare(`
+        UPDATE products
+        SET name=?
+        WHERE id=?
+      `)
+      .bind(
+        text,
+        state.payload.productId
+      )
+      .run();
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    await sendOrEdit(
+      env,
+      chatId,
+      null,
+      `✅ Đã sửa tên sản phẩm thành:\n\n` +
+      `<b>${esc(text)}</b>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Quay Lại",
+              callback_data:
+                `ap:${state.payload.productId}`
+            }
+          ]
+        ]
+      }
+    );
+
+    return true;
+  }
+
+
+  /*
+    ADD ITEM TITLE
+  */
+
+  if (
+    state.action ===
+    "ADD_ITEM_TITLE"
+  ) {
+    await setAdminState(
+      env,
+      userId,
+      "ADD_ITEM_PRICE",
+      {
+        ...state.payload,
+        title: text
+      }
+    );
+
+    await tg(
+      env,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          `💰 Nhập giá cho gói <b>${esc(
+            text
+          )}</b>\n\n` +
+
+          `Ví dụ: <code>50000</code>`
+      }
+    );
+
+    return true;
+  }
+
+
+  if (
+    state.action ===
+    "ADD_ITEM_PRICE"
+  ) {
+    const price =
+      parseMoney(text);
+
+    if (
+      !Number.isSafeInteger(price) ||
+      price < 0
+    ) {
+      await tg(
+        env,
+        "sendMessage",
+        {
+          chat_id: chatId,
+          text:
+            `❌ Giá không hợp lệ.\nNhập lại.`
+        }
+      );
+
+      return true;
+    }
+
+    await setAdminState(
+      env,
+      userId,
+      "ADD_ITEM_STOCK",
+      {
+        ...state.payload,
+        price
+      }
+    );
+
+    await tg(
+      env,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          `📦 Nhập số lượng kho.\n\n` +
+          `Ví dụ: <code>100</code>`
+      }
+    );
+
+    return true;
+  }
+
+
+  if (
+    state.action ===
+    "ADD_ITEM_STOCK"
+  ) {
+    const stock =
+      parseMoney(text);
+
+    if (
+      !Number.isSafeInteger(stock) ||
+      stock < 0
+    ) {
+      return true;
+    }
+
+    const productId =
+      state.payload.productId;
+
+    const max = await env.DB
+      .prepare(`
+        SELECT
+          COALESCE(
+            MAX(sort_order),
+            0
+          ) AS max_sort
+        FROM product_items
+        WHERE product_id=?
+      `)
+      .bind(productId)
+      .first();
+
+    const itemId =
+      rid("ITEM");
+
+    await env.DB
+      .prepare(`
+        INSERT INTO product_items(
+          id,
+          product_id,
+          title,
+          price,
+          stock,
+          sort_order
+        )
+        VALUES(?,?,?,?,?,?)
+      `)
+      .bind(
+        itemId,
+        productId,
+        state.payload.title,
+        state.payload.price,
+        stock,
+        Number(max.max_sort || 0) + 1
+      )
+      .run();
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    await sendOrEdit(
+      env,
+      chatId,
+      null,
+      `✅ <b>ĐÃ THÊM GÓI</b>\n\n` +
+
+      `🏷️ ${esc(
+        state.payload.title
+      )}\n` +
+
+      `💰 ${money(
+        state.payload.price
+      )}\n` +
+
+      `📦 Kho: ${stock}`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⚙️ Quản Lý Gói",
+              callback_data:
+                `ai:${itemId}`
+            }
+          ],
+          [
+            {
+              text:
+                "⬅️ Sản Phẩm",
+              callback_data:
+                `ap:${productId}`
+            }
+          ]
+        ]
+      }
+    );
+
+    return true;
+  }
+
+
+  /*
+    EDIT ITEM TITLE
+  */
+
+  if (
+    state.action ===
+    "EDIT_ITEM_TITLE"
+  ) {
+    await env.DB
+      .prepare(`
+        UPDATE product_items
+        SET title=?
+        WHERE id=?
+      `)
+      .bind(
+        text,
+        state.payload.itemId
+      )
+      .run();
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      null,
+      `✅ Đã sửa tên gói.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Quay Lại",
+              callback_data:
+                `ai:${state.payload.itemId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /*
+    EDIT ITEM PRICE
+  */
+
+  if (
+    state.action ===
+    "EDIT_ITEM_PRICE"
+  ) {
+    const price =
+      parseMoney(text);
+
+    if (
+      !Number.isSafeInteger(price) ||
+      price < 0
+    ) {
+      return true;
+    }
+
+    await env.DB
+      .prepare(`
+        UPDATE product_items
+        SET price=?
+        WHERE id=?
+      `)
+      .bind(
+        price,
+        state.payload.itemId
+      )
+      .run();
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      null,
+      `✅ Đã sửa giá thành <b>${money(
+        price
+      )}</b>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Quay Lại",
+              callback_data:
+                `ai:${state.payload.itemId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /*
+    EDIT ITEM STOCK
+  */
+
+  if (
+    state.action ===
+    "EDIT_ITEM_STOCK"
+  ) {
+    const stock =
+      parseMoney(text);
+
+    if (
+      !Number.isSafeInteger(stock) ||
+      stock < 0
+    ) {
+      return true;
+    }
+
+    await env.DB
+      .prepare(`
+        UPDATE product_items
+        SET stock=?
+        WHERE id=?
+      `)
+      .bind(
+        stock,
+        state.payload.itemId
+      )
+      .run();
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      null,
+      `✅ Đã cập nhật kho: <b>${stock}</b>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Quay Lại",
+              callback_data:
+                `ai:${state.payload.itemId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /*
+    FIND USER
+  */
+
+  if (
+    state.action ===
+    "FIND_USER"
+  ) {
+    const search =
+      text.replace("@", "");
+
+    let user = await env.DB
+      .prepare(`
+        SELECT *
+        FROM users
+        WHERE telegram_id=?
+      `)
+      .bind(search)
+      .first();
+
+    if (!user) {
+      user = await env.DB
+        .prepare(`
+          SELECT *
+          FROM users
+          WHERE LOWER(username)=LOWER(?)
+          LIMIT 1
+        `)
+        .bind(search)
+        .first();
+    }
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    if (!user) {
+      await sendOrEdit(
+        env,
+        chatId,
+        null,
+        `❌ Không tìm thấy user.`,
+        {
+          inline_keyboard: [
+            [
+              {
+                text:
+                  "🔎 Tìm Lại",
+                callback_data:
+                  "admin_find_user"
+              }
+            ],
+            [
+              {
+                text:
+                  "⬅️ Admin",
+                callback_data:
+                  "admin"
+              }
+            ]
+          ]
+        }
+      );
+
+      return true;
+    }
+
+    await sendOrEdit(
+      env,
+      chatId,
+      null,
+      `👤 <b>THÔNG TIN USER</b>\n` +
+      `━━━━━━━━━━━━\n\n` +
+
+      `🆔 <code>${user.telegram_id}</code>\n` +
+
+      `👤 ${esc(
+        user.first_name ||
+        user.username ||
+        "Không rõ"
+      )}\n` +
+
+      `💳 Số dư: <b>${money(
+        user.balance
+      )}</b>\n` +
+
+      `💰 Tổng nạp: <b>${money(
+        user.total_deposit
+      )}</b>\n` +
+
+      `💸 Tổng chi: <b>${money(
+        user.total_spent
+      )}</b>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "💰 Cộng Tiền User Này",
+              callback_data:
+                `admin_credit:${user.telegram_id}`
+            }
+          ],
+          [
+            {
+              text:
+                "⬅️ Admin",
+              callback_data:
+                "admin"
+            }
+          ]
+        ]
+      }
+    );
+
+    return true;
+  }
+
+
+  /*
+    ADD MONEY SEARCH USER
+  */
+
+  if (
+    state.action ===
+    "ADD_MONEY_USER"
+  ) {
+    const search =
+      text.replace("@", "");
+
+    let target = await env.DB
+      .prepare(`
+        SELECT *
+        FROM users
+        WHERE telegram_id=?
+      `)
+      .bind(search)
+      .first();
+
+    if (!target) {
+      target = await env.DB
+        .prepare(`
+          SELECT *
+          FROM users
+          WHERE LOWER(username)=LOWER(?)
+          LIMIT 1
+        `)
+        .bind(search)
+        .first();
+    }
+
+    if (!target) {
+      await tg(
+        env,
+        "sendMessage",
+        {
+          chat_id: chatId,
+          text:
+            `❌ Không tìm thấy user.\n` +
+            `Nhập lại ID hoặc username.`
+        }
+      );
+
+      return true;
+    }
+
+    await setAdminState(
+      env,
+      userId,
+      "ADD_MONEY_AMOUNT",
+      {
+        targetId:
+          target.telegram_id,
+
+        targetName:
+          target.first_name ||
+          target.username ||
+          target.telegram_id
+      }
+    );
+
+    await tg(
+      env,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          `👤 User: <b>${esc(
+            target.first_name ||
+            target.username ||
+            target.telegram_id
+          )}</b>\n` +
+
+          `🆔 <code>${target.telegram_id}</code>\n` +
+
+          `💳 Số dư hiện tại: <b>${money(
+            target.balance
+          )}</b>\n\n` +
+
+          `💰 Nhập số tiền muốn cộng:`
+      }
+    );
+
+    return true;
+  }
+
+
+  /*
+    ADD MONEY AMOUNT
+  */
+
+  if (
+    state.action ===
+    "ADD_MONEY_AMOUNT"
+  ) {
+    const amount =
+      parseMoney(text);
+
+    if (
+      !Number.isSafeInteger(amount) ||
+      amount <= 0
+    ) {
+      return true;
+    }
+
+    const targetId =
+      state.payload.targetId;
+
+    const before = await env.DB
+      .prepare(`
+        SELECT *
+        FROM users
+        WHERE telegram_id=?
+      `)
+      .bind(targetId)
+      .first();
+
+    if (!before) {
+      await clearAdminState(
+        env,
+        userId
+      );
+
+      return true;
+    }
+
+    await env.DB
+      .prepare(`
+        UPDATE users
+        SET balance=balance+?
+        WHERE telegram_id=?
+      `)
+      .bind(
+        amount,
+        targetId
+      )
+      .run();
+
+    const after = await env.DB
+      .prepare(`
+        SELECT *
+        FROM users
+        WHERE telegram_id=?
+      `)
+      .bind(targetId)
+      .first();
+
+    await clearAdminState(
+      env,
+      userId
+    );
+
+    await sendOrEdit(
+      env,
+      chatId,
+      null,
+      `✅ <b>ĐÃ CỘNG TIỀN</b>\n\n` +
+
+      `👤 ${esc(
+        after.first_name ||
+        after.username ||
+        after.telegram_id
+      )}\n` +
+
+      `🆔 <code>${targetId}</code>\n` +
+
+      `➕ Đã cộng: <b>${money(
+        amount
+      )}</b>\n` +
+
+      `💳 Số dư mới: <b>${money(
+        after.balance
+      )}</b>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "💰 Cộng Tiếp",
+              callback_data:
+                `admin_credit:${targetId}`
+            }
+          ],
+          [
+            {
+              text:
+                "⬅️ Admin",
+              callback_data:
+                "admin"
+            }
+          ]
+        ]
+      }
+    );
+
+    /*
+      Thông báo user nhưng nếu Telegram lỗi
+      không làm hỏng thao tác admin.
+    */
+
+    tg(
+      env,
+      "sendMessage",
+      {
+        chat_id: targetId,
+        parse_mode: "HTML",
+        text:
+          `💰 <b>BẠN ĐƯỢC CỘNG TIỀN</b>\n\n` +
+
+          `➕ Số tiền: <b>${money(
+            amount
+          )}</b>\n` +
+
+          `💳 Số dư hiện tại: <b>${money(
+            after.balance
+          )}</b>`
+      }
+    ).catch(
+      e => console.error(
+        "notify credit",
+        e
+      )
+    );
+
+    return true;
+  }
+
+  return false;
 }
 
 
@@ -1824,23 +3720,28 @@ async function handleUpdate(
   await ensureSeed(env);
 
 
-  /* -------------------------
+  /* =======================================================
      MESSAGE
-  ------------------------- */
+  ======================================================= */
 
   if (update.message?.from) {
-    await ensureUser(
-      env,
-      update.message.from
-    );
-
     const m =
       update.message;
+
+    await ensureUser(
+      env,
+      m.from
+    );
 
     if (
       m.text &&
       m.text.startsWith("/start")
     ) {
+      await clearAdminState(
+        env,
+        m.from.id
+      );
+
       return showHome(
         env,
         m.chat.id,
@@ -1853,6 +3754,24 @@ async function handleUpdate(
     }
 
     if (m.text) {
+      /*
+        ADMIN INPUT xử lý trước.
+      */
+
+      const adminHandled =
+        await handleAdminMessage(
+          env,
+          m
+        );
+
+      if (adminHandled) {
+        return;
+      }
+
+      /*
+        Sau đó mới xử lý nạp tiền.
+      */
+
       const created =
         await createDeposit(
           env,
@@ -1863,12 +3782,14 @@ async function handleUpdate(
         return;
       }
     }
+
+    return;
   }
 
 
-  /* -------------------------
+  /* =======================================================
      CALLBACK
-  ------------------------- */
+  ======================================================= */
 
   if (!update.callback_query) {
     return;
@@ -1886,27 +3807,13 @@ async function handleUpdate(
   const userId =
     q.from.id;
 
-  const user =
-    await ensureUser(
-      env,
-      q.from
-    );
-
   const data =
     q.data || "";
 
-
-  if (data === "noop") {
-    return tg(
-      env,
-      "answerCallbackQuery",
-      {
-        callback_query_id:
-          q.id
-      }
-    );
-  }
-
+  /*
+    ACK CALLBACK NGAY.
+    Đây là phần giúp Telegram không hiện loading lâu.
+  */
 
   await tg(
     env,
@@ -1917,10 +3824,25 @@ async function handleUpdate(
     }
   ).catch(() => {});
 
+  const user =
+    await ensureUser(
+      env,
+      q.from
+    );
 
-  /* -------------------------
+
+  /* =======================================================
+     NOOP
+  ======================================================= */
+
+  if (data === "noop") {
+    return;
+  }
+
+
+  /* =======================================================
      HOME
-  ------------------------- */
+  ======================================================= */
 
   if (data === "home") {
     return showHome(
@@ -1930,32 +3852,38 @@ async function handleUpdate(
       q.from.first_name ||
         q.from.username ||
         "bạn",
-      q.from.id
+      userId
     );
   }
 
 
-  /* -------------------------
-     ADMIN
-  ------------------------- */
+  /* =======================================================
+     ADMIN CHECK
+  ======================================================= */
+
+  const adminActions =
+    data === "admin" ||
+    data.startsWith("admin_") ||
+    data.startsWith("ap:") ||
+    data.startsWith("ai:");
+
+  if (
+    adminActions &&
+    !isAdmin(userId)
+  ) {
+    return;
+  }
+
+
+  /* =======================================================
+     ADMIN PANEL
+  ======================================================= */
 
   if (data === "admin") {
-    if (!isAdmin(userId)) {
-      return tg(
-        env,
-        "answerCallbackQuery",
-        {
-          callback_query_id:
-            q.id,
-
-          text:
-            "Bạn không có quyền truy cập Admin Panel!",
-
-          show_alert:
-            true
-        }
-      );
-    }
+    await clearAdminState(
+      env,
+      userId
+    );
 
     return showAdminPanel(
       env,
@@ -1966,12 +3894,699 @@ async function handleUpdate(
 
 
   if (
-    data === "admin_deposits"
+    data === "admin_products"
   ) {
-    if (!isAdmin(userId)) {
+    return showAdminProducts(
+      env,
+      chatId,
+      msgId
+    );
+  }
+
+
+  if (
+    data.startsWith("ap:")
+  ) {
+    return showAdminProduct(
+      env,
+      chatId,
+      msgId,
+      data.slice(3)
+    );
+  }
+
+
+  if (
+    data.startsWith("ai:")
+  ) {
+    return showAdminItem(
+      env,
+      chatId,
+      msgId,
+      data.slice(3)
+    );
+  }
+
+
+  /* =======================================================
+     ADD PRODUCT
+  ======================================================= */
+
+  if (
+    data === "admin_add_product"
+  ) {
+    await setAdminState(
+      env,
+      userId,
+      "ADD_PRODUCT_NAME"
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `➕ <b>THÊM SẢN PHẨM</b>\n\n` +
+
+      `Nhập tên sản phẩm.\n\n` +
+
+      `Ví dụ: <code>Migui Premium</code>\n\n` +
+
+      `Gõ /cancel để hủy.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "❌ Hủy",
+              callback_data:
+                "admin"
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /* =======================================================
+     EDIT PRODUCT
+  ======================================================= */
+
+  if (
+    data.startsWith(
+      "admin_edit_product:"
+    )
+  ) {
+    const productId =
+      data.slice(
+        "admin_edit_product:".length
+      );
+
+    await setAdminState(
+      env,
+      userId,
+      "EDIT_PRODUCT_NAME",
+      {
+        productId
+      }
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `✏️ Nhập tên mới cho sản phẩm.\n\n` +
+      `Gõ /cancel để hủy.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Quay Lại",
+              callback_data:
+                `ap:${productId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /* =======================================================
+     TOGGLE PRODUCT
+  ======================================================= */
+
+  if (
+    data.startsWith(
+      "admin_toggle_product:"
+    )
+  ) {
+    const productId =
+      data.slice(
+        "admin_toggle_product:".length
+      );
+
+    await env.DB
+      .prepare(`
+        UPDATE products
+        SET active=
+          CASE
+            WHEN active=1 THEN 0
+            ELSE 1
+          END
+        WHERE id=?
+      `)
+      .bind(productId)
+      .run();
+
+    return showAdminProduct(
+      env,
+      chatId,
+      msgId,
+      productId
+    );
+  }
+
+
+  /* =======================================================
+     DELETE PRODUCT
+  ======================================================= */
+
+  if (
+    data.startsWith(
+      "admin_delete_product:"
+    )
+  ) {
+    const productId =
+      data.slice(
+        "admin_delete_product:".length
+      );
+
+    const p = await env.DB
+      .prepare(`
+        SELECT *
+        FROM products
+        WHERE id=?
+      `)
+      .bind(productId)
+      .first();
+
+    if (!p) {
+      return showAdminProducts(
+        env,
+        chatId,
+        msgId
+      );
+    }
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `⚠️ <b>XÁC NHẬN XÓA</b>\n\n` +
+
+      `Bạn có chắc muốn xóa:\n` +
+
+      `📦 <b>${esc(
+        p.name
+      )}</b>\n\n` +
+
+      `Toàn bộ gói bên trong cũng sẽ bị xóa.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "🗑️ XÓA VĨNH VIỄN",
+              callback_data:
+                `admin_delete_product_yes:${productId}`
+            }
+          ],
+          [
+            {
+              text:
+                "❌ Hủy",
+              callback_data:
+                `ap:${productId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  if (
+    data.startsWith(
+      "admin_delete_product_yes:"
+    )
+  ) {
+    const productId =
+      data.slice(
+        "admin_delete_product_yes:".length
+      );
+
+    await env.DB.batch([
+      env.DB
+        .prepare(`
+          DELETE FROM product_items
+          WHERE product_id=?
+        `)
+        .bind(productId),
+
+      env.DB
+        .prepare(`
+          DELETE FROM products
+          WHERE id=?
+        `)
+        .bind(productId)
+    ]);
+
+    return showAdminProducts(
+      env,
+      chatId,
+      msgId
+    );
+  }
+
+
+  /* =======================================================
+     ADD ITEM
+  ======================================================= */
+
+  if (
+    data.startsWith(
+      "admin_add_item:"
+    )
+  ) {
+    const productId =
+      data.slice(
+        "admin_add_item:".length
+      );
+
+    await setAdminState(
+      env,
+      userId,
+      "ADD_ITEM_TITLE",
+      {
+        productId
+      }
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `➕ <b>THÊM GÓI SẢN PHẨM</b>\n\n` +
+
+      `Nhập tên gói.\n\n` +
+
+      `Ví dụ: <code>7 Ngày</code>\n\n` +
+
+      `Gõ /cancel để hủy.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Quay Lại",
+              callback_data:
+                `ap:${productId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /* =======================================================
+     EDIT ITEM
+  ======================================================= */
+
+  if (
+    data.startsWith(
+      "admin_edit_item_title:"
+    )
+  ) {
+    const itemId =
+      data.slice(
+        "admin_edit_item_title:".length
+      );
+
+    await setAdminState(
+      env,
+      userId,
+      "EDIT_ITEM_TITLE",
+      {
+        itemId
+      }
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `✏️ Nhập tên gói mới.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Hủy",
+              callback_data:
+                `ai:${itemId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  if (
+    data.startsWith(
+      "admin_edit_item_price:"
+    )
+  ) {
+    const itemId =
+      data.slice(
+        "admin_edit_item_price:".length
+      );
+
+    await setAdminState(
+      env,
+      userId,
+      "EDIT_ITEM_PRICE",
+      {
+        itemId
+      }
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `💰 Nhập giá mới.\n\n` +
+      `Ví dụ: <code>50000</code>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Hủy",
+              callback_data:
+                `ai:${itemId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  if (
+    data.startsWith(
+      "admin_edit_item_stock:"
+    )
+  ) {
+    const itemId =
+      data.slice(
+        "admin_edit_item_stock:".length
+      );
+
+    await setAdminState(
+      env,
+      userId,
+      "EDIT_ITEM_STOCK",
+      {
+        itemId
+      }
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `📦 Nhập số lượng kho mới.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Hủy",
+              callback_data:
+                `ai:${itemId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /* =======================================================
+     DELETE ITEM
+  ======================================================= */
+
+  if (
+    data.startsWith(
+      "admin_delete_item:"
+    )
+  ) {
+    const itemId =
+      data.slice(
+        "admin_delete_item:".length
+      );
+
+    const item = await env.DB
+      .prepare(`
+        SELECT *
+        FROM product_items
+        WHERE id=?
+      `)
+      .bind(itemId)
+      .first();
+
+    if (!item) {
+      return showAdminProducts(
+        env,
+        chatId,
+        msgId
+      );
+    }
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `⚠️ Xóa gói <b>${esc(
+        item.title
+      )}</b>?`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "🗑️ Xóa",
+              callback_data:
+                `admin_delete_item_yes:${itemId}`
+            }
+          ],
+          [
+            {
+              text:
+                "❌ Hủy",
+              callback_data:
+                `ai:${itemId}`
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  if (
+    data.startsWith(
+      "admin_delete_item_yes:"
+    )
+  ) {
+    const itemId =
+      data.slice(
+        "admin_delete_item_yes:".length
+      );
+
+    const item = await env.DB
+      .prepare(`
+        SELECT *
+        FROM product_items
+        WHERE id=?
+      `)
+      .bind(itemId)
+      .first();
+
+    if (!item) {
+      return showAdminProducts(
+        env,
+        chatId,
+        msgId
+      );
+    }
+
+    await env.DB
+      .prepare(`
+        DELETE FROM product_items
+        WHERE id=?
+      `)
+      .bind(itemId)
+      .run();
+
+    return showAdminProduct(
+      env,
+      chatId,
+      msgId,
+      item.product_id
+    );
+  }
+
+
+  /* =======================================================
+     ADMIN ADD MONEY
+  ======================================================= */
+
+  if (
+    data === "admin_add_money"
+  ) {
+    await setAdminState(
+      env,
+      userId,
+      "ADD_MONEY_USER"
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `💰 <b>CỘNG TIỀN USER</b>\n\n` +
+
+      `Nhập Telegram ID hoặc username.\n\n` +
+
+      `Ví dụ:\n` +
+      `<code>7424477198</code>\n` +
+      `hoặc\n` +
+      `<code>@username</code>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Hủy",
+              callback_data:
+                "admin"
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  if (
+    data.startsWith(
+      "admin_credit:"
+    )
+  ) {
+    const targetId =
+      data.slice(
+        "admin_credit:".length
+      );
+
+    const target = await env.DB
+      .prepare(`
+        SELECT *
+        FROM users
+        WHERE telegram_id=?
+      `)
+      .bind(targetId)
+      .first();
+
+    if (!target) {
       return;
     }
 
+    await setAdminState(
+      env,
+      userId,
+      "ADD_MONEY_AMOUNT",
+      {
+        targetId:
+          target.telegram_id,
+
+        targetName:
+          target.first_name ||
+          target.username ||
+          target.telegram_id
+      }
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `💰 <b>CỘNG TIỀN</b>\n\n` +
+
+      `👤 ${esc(
+        target.first_name ||
+        target.username ||
+        target.telegram_id
+      )}\n` +
+
+      `💳 Số dư: <b>${money(
+        target.balance
+      )}</b>\n\n` +
+
+      `Nhập số tiền muốn cộng.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Hủy",
+              callback_data:
+                "admin"
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /* =======================================================
+     FIND USER
+  ======================================================= */
+
+  if (
+    data === "admin_find_user"
+  ) {
+    await setAdminState(
+      env,
+      userId,
+      "FIND_USER"
+    );
+
+    return sendOrEdit(
+      env,
+      chatId,
+      msgId,
+      `🔎 <b>TÌM USER</b>\n\n` +
+
+      `Nhập Telegram ID hoặc username.`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "⬅️ Hủy",
+              callback_data:
+                "admin"
+            }
+          ]
+        ]
+      }
+    );
+  }
+
+
+  /* =======================================================
+     ADMIN DEPOSITS
+  ======================================================= */
+
+  if (
+    data === "admin_deposits"
+  ) {
     return showAdminDeposits(
       env,
       chatId,
@@ -1983,10 +4598,6 @@ async function handleUpdate(
   if (
     data === "admin_users"
   ) {
-    if (!isAdmin(userId)) {
-      return;
-    }
-
     return showAdminUsers(
       env,
       chatId,
@@ -1995,9 +4606,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      BUY
-  ------------------------- */
+  ======================================================= */
 
   if (data === "buy") {
     return showProducts(
@@ -2008,9 +4619,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      DEPOSIT
-  ------------------------- */
+  ======================================================= */
 
   if (data === "deposit") {
     return promptDeposit(
@@ -2022,9 +4633,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      PROFILE
-  ------------------------- */
+  ======================================================= */
 
   if (data === "profile") {
     return showProfile(
@@ -2036,9 +4647,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      TOP
-  ------------------------- */
+  ======================================================= */
 
   if (data === "top") {
     return showTop(
@@ -2050,9 +4661,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      HISTORY
-  ------------------------- */
+  ======================================================= */
 
   if (data === "history") {
     return showHistory(
@@ -2064,9 +4675,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      SUPPORT
-  ------------------------- */
+  ======================================================= */
 
   if (data === "support") {
     return showSupport(
@@ -2077,9 +4688,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      PRODUCT
-  ------------------------- */
+  ======================================================= */
 
   if (
     data.startsWith("p:")
@@ -2093,9 +4704,9 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      ITEM
-  ------------------------- */
+  ======================================================= */
 
   if (
     data.startsWith("i:")
@@ -2109,12 +4720,14 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
-     CONFIRM BUY
-  ------------------------- */
+  /* =======================================================
+     BUY CONFIRM
+  ======================================================= */
 
   if (
-    data.startsWith("confirm:")
+    data.startsWith(
+      "confirm:"
+    )
   ) {
     return buyItem(
       env,
@@ -2126,12 +4739,14 @@ async function handleUpdate(
   }
 
 
-  /* -------------------------
+  /* =======================================================
      CHECK DEPOSIT
-  ------------------------- */
+  ======================================================= */
 
   if (
-    data.startsWith("check:")
+    data.startsWith(
+      "check:"
+    )
   ) {
     try {
       const d =
@@ -2146,20 +4761,35 @@ async function handleUpdate(
         await notifyPaid(
           env,
           d
+        ).catch(
+          e => console.error(
+            "notify paid",
+            e
+          )
         );
 
-        return tg(
+        return sendOrEdit(
           env,
-          "answerCallbackQuery",
+          chatId,
+          msgId,
+          `✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n\n` +
+
+          `💰 Đã cộng: <b>${money(
+            d.amount
+          )}</b>\n\n` +
+
+          `Bạn có thể tiếp tục sử dụng bot.`,
           {
-            callback_query_id:
-              q.id,
-
-            text:
-              "Đã xác nhận và cộng tiền!",
-
-            show_alert:
-              true
+            inline_keyboard: [
+              [
+                {
+                  text:
+                    "🏠 Trang Chủ",
+                  callback_data:
+                    "home"
+                }
+              ]
+            ]
           }
         );
       }
@@ -2167,21 +4797,32 @@ async function handleUpdate(
       if (
         d?.status === "EXPIRED"
       ) {
-        return tg(
+        return sendOrEdit(
           env,
-          "answerCallbackQuery",
+          chatId,
+          msgId,
+          `⌛ <b>ĐƠN NẠP ĐÃ HẾT HẠN</b>\n\n` +
+          `Vui lòng tạo đơn mới.`,
           {
-            callback_query_id:
-              q.id,
-
-            text:
-              "Đơn nạp đã hết hạn.",
-
-            show_alert:
-              true
+            inline_keyboard: [
+              [
+                {
+                  text:
+                    "💳 Nạp Lại",
+                  callback_data:
+                    "deposit"
+                }
+              ]
+            ]
           }
         );
       }
+
+      /*
+        Không edit message liên tục
+        khi chưa có giao dịch,
+        chỉ gửi alert nhẹ.
+      */
 
       return tg(
         env,
@@ -2196,27 +4837,117 @@ async function handleUpdate(
           show_alert:
             true
         }
-      );
+      ).catch(() => {});
 
     } catch (e) {
-      console.error(e);
+      console.error(
+        "check deposit",
+        e
+      );
 
       return tg(
         env,
-        "answerCallbackQuery",
+        "sendMessage",
         {
-          callback_query_id:
-            q.id,
-
+          chat_id: chatId,
+          parse_mode: "HTML",
           text:
-            "Chưa thể kiểm tra giao dịch. Thử lại sau.",
-
-          show_alert:
-            true
+            `⚠️ Chưa thể kiểm tra giao dịch.\n` +
+            `Vui lòng thử lại sau.`
         }
       );
     }
   }
+}
+
+
+/* =========================================================
+   SCHEDULED
+========================================================= */
+
+async function runDepositPoll(
+  env
+) {
+  await ensureSeed(env);
+
+  const pending = await env.DB
+    .prepare(`
+      SELECT id
+      FROM deposits
+      WHERE
+        status='PENDING'
+        AND expires_at>?
+      ORDER BY created_at
+      LIMIT 50
+    `)
+    .bind(nowISO())
+    .all();
+
+  /*
+    Chạy tuần tự để tránh spam API ngân hàng
+    và tránh Worker bị quá tải.
+  */
+
+  for (
+    const x of pending.results
+  ) {
+    try {
+      const d =
+        await checkDeposit(
+          env,
+          x.id
+        );
+
+      if (
+        d?.status === "PAID"
+      ) {
+        await notifyPaid(
+          env,
+          d
+        ).catch(
+          e => console.error(
+            "notify cron",
+            e
+          )
+        );
+      }
+
+    } catch (e) {
+      console.error(
+        "deposit poll",
+        x.id,
+        e.message
+      );
+    }
+  }
+
+  await env.DB
+    .prepare(`
+      UPDATE deposits
+      SET status='EXPIRED'
+      WHERE
+        status='PENDING'
+        AND expires_at<=?
+    `)
+    .bind(nowISO())
+    .run();
+
+  /*
+    Xóa admin state quá cũ để DB không phình.
+  */
+
+  await env.DB
+    .prepare(`
+      DELETE FROM admin_states
+      WHERE updated_at<?
+    `)
+    .bind(
+      new Date(
+        Date.now() -
+        24 * 60 * 60 * 1000
+      ).toISOString()
+    )
+    .run();
 }
 
 
@@ -2227,7 +4958,8 @@ async function handleUpdate(
 export default {
   async fetch(
     request,
-    env
+    env,
+    ctx
   ) {
     const u =
       new URL(
@@ -2243,18 +4975,42 @@ export default {
       );
     }
 
+
     if (
       request.method === "POST" &&
       u.pathname === "/webhook"
     ) {
+      let update;
+
       try {
-        await handleUpdate(
-          env,
-          await request.json()
+        update =
+          await request.json();
+
+      } catch {
+        return new Response(
+          "bad request",
+          {
+            status: 400
+          }
         );
-      } catch (e) {
-        console.error(e);
       }
+
+      /*
+        Dùng waitUntil để Worker trả HTTP OK
+        nhanh hơn Telegram, giảm webhook retry.
+      */
+
+      ctx.waitUntil(
+        handleUpdate(
+          env,
+          update
+        ).catch(
+          e => console.error(
+            "handle update",
+            e
+          )
+        )
+      );
 
       return new Response(
         "ok"
@@ -2276,62 +5032,14 @@ export default {
     ctx
   ) {
     ctx.waitUntil(
-      (async () => {
-        await ensureSeed(env);
-
-        const pending =
-          await env.DB
-            .prepare(`
-              SELECT id
-              FROM deposits
-              WHERE
-                status='PENDING'
-                AND expires_at>?
-              ORDER BY created_at
-              LIMIT 50
-            `)
-            .bind(nowISO())
-            .all();
-
-        for (
-          const x of pending.results
-        ) {
-          try {
-            const d =
-              await checkDeposit(
-                env,
-                x.id
-              );
-
-            if (
-              d?.status === "PAID"
-            ) {
-              await notifyPaid(
-                env,
-                d
-              );
-            }
-
-          } catch (e) {
-            console.error(
-              "deposit poll",
-              x.id,
-              e.message
-            );
-          }
-        }
-
-        await env.DB
-          .prepare(`
-            UPDATE deposits
-            SET status='EXPIRED'
-            WHERE
-              status='PENDING'
-              AND expires_at<=?
-          `)
-          .bind(nowISO())
-          .run();
-      })()
+      runDepositPoll(
+        env
+      ).catch(
+        e => console.error(
+          "scheduled",
+          e
+        )
+      )
     );
   }
 };
