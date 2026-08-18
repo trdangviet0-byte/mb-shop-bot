@@ -1,5 +1,9 @@
 const ADMIN_ID = "7424477198";
 
+// SePay: đặt số tài khoản nhận tiền để webhook chỉ xử lý đúng STK này.
+// Nếu để trống, bot vẫn kiểm tra chữ ký + số tiền + mã đơn.
+const SEPAY_BANK_ACCOUNT_ENV = "SEPAY_BANK_ACCOUNT";
+
 /* =========================================================
    CONFIG
 ========================================================= */
@@ -183,6 +187,27 @@ async function ensureSchema(env) {
     await env.DB.prepare(`
       ALTER TABLE deposits
       ADD COLUMN notified_at TEXT
+    `).run();
+  } catch {}
+
+  try {
+    await env.DB.prepare(`
+      ALTER TABLE deposits
+      ADD COLUMN admin_pending_notified_at TEXT
+    `).run();
+  } catch {}
+
+  try {
+    await env.DB.prepare(`
+      ALTER TABLE deposits
+      ADD COLUMN admin_paid_notified_at TEXT
+    `).run();
+  } catch {}
+
+  try {
+    await env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_deposits_bank_transaction
+      ON deposits(bank_transaction_id)
     `).run();
   } catch {}
 
@@ -1882,6 +1907,26 @@ async function createDeposit(
     )
     .run();
 
+  const pendingDeposit =
+    await env.DB
+      .prepare(`
+        SELECT *
+        FROM deposits
+        WHERE id=?
+      `)
+      .bind(id)
+      .first();
+
+  await notifyAdminDepositPending(
+    env,
+    pendingDeposit
+  ).catch(
+    e => console.error(
+      "admin pending notification",
+      e
+    )
+  );
+
   const qr =
     `https://img.vietqr.io/image/` +
     `MB-${encodeURIComponent(
@@ -2477,6 +2522,432 @@ function txId(tx) {
 
 
 /* =========================================================
+   ADMIN DEPOSIT NOTIFICATIONS + PAYMENT SETTLEMENT
+========================================================= */
+
+async function notifyAdminDepositPending(env, d) {
+  if (!d) return;
+
+  const claim = await env.DB
+    .prepare(`
+      UPDATE deposits
+      SET admin_pending_notified_at=?
+      WHERE
+        id=?
+        AND (
+          admin_pending_notified_at IS NULL
+          OR admin_pending_notified_at=''
+        )
+    `)
+    .bind(nowISO(), d.id)
+    .run();
+
+  if (Number(claim.meta.changes) !== 1) return;
+
+  try {
+    await tg(env, "sendMessage", {
+      chat_id: ADMIN_ID,
+      parse_mode: "HTML",
+      text:
+        `📢 <b>Thông Báo: Admin 🧑‍💻</b>\n\n` +
+        `🆔 <b>Mã Đơn:</b> <code>${esc(d.content)}</code>\n` +
+        `🛒 <b>Đơn Hàng:</b> 💰Nạp Tiền\n` +
+        `📌 <b>Trạng Thái:</b> Chưa Xử Lí`
+    });
+  } catch (e) {
+    await env.DB
+      .prepare(`
+        UPDATE deposits
+        SET admin_pending_notified_at=NULL
+        WHERE id=?
+      `)
+      .bind(d.id)
+      .run();
+    throw e;
+  }
+}
+
+
+async function notifyAdminDepositPaid(env, d) {
+  if (!d) return;
+
+  const claim = await env.DB
+    .prepare(`
+      UPDATE deposits
+      SET admin_paid_notified_at=?
+      WHERE
+        id=?
+        AND (
+          admin_paid_notified_at IS NULL
+          OR admin_paid_notified_at=''
+        )
+    `)
+    .bind(nowISO(), d.id)
+    .run();
+
+  if (Number(claim.meta.changes) !== 1) return;
+
+  try {
+    await tg(env, "sendMessage", {
+      chat_id: ADMIN_ID,
+      parse_mode: "HTML",
+      text:
+        `📢 <b>Thông Báo: Admin 🧑‍💻</b>\n\n` +
+        `🆔 <b>Mã Đơn:</b> <code>${esc(d.content)}</code>\n` +
+        `🛒 <b>Đơn Hàng:</b> 💰Nạp Tiền\n` +
+        `📌 <b>Trạng Thái:</b> Húp`
+    });
+  } catch (e) {
+    await env.DB
+      .prepare(`
+        UPDATE deposits
+        SET admin_paid_notified_at=NULL
+        WHERE id=?
+      `)
+      .bind(d.id)
+      .run();
+    throw e;
+  }
+}
+
+
+async function settleDeposit(env, d, transactionId, rawTransaction) {
+  if (!d || d.status !== "PENDING") return d;
+
+  const existing = await env.DB
+    .prepare(`
+      SELECT id, status
+      FROM deposits
+      WHERE bank_transaction_id=?
+      LIMIT 1
+    `)
+    .bind(String(transactionId))
+    .first();
+
+  if (existing) {
+    return env.DB
+      .prepare(`SELECT * FROM deposits WHERE id=?`)
+      .bind(d.id)
+      .first();
+  }
+
+  const claim = await env.DB
+    .prepare(`
+      UPDATE deposits
+      SET
+        status='PAID',
+        bank_transaction_id=?,
+        bank_raw=?,
+        paid_at=?
+      WHERE
+        id=?
+        AND status='PENDING'
+    `)
+    .bind(
+      String(transactionId),
+      String(rawTransaction || "").slice(0, 20000),
+      nowISO(),
+      d.id
+    )
+    .run();
+
+  if (Number(claim.meta.changes) !== 1) {
+    return env.DB
+      .prepare(`SELECT * FROM deposits WHERE id=?`)
+      .bind(d.id)
+      .first();
+  }
+
+  const userUpdate = await env.DB
+    .prepare(`
+      UPDATE users
+      SET
+        balance=balance+?,
+        total_deposit=total_deposit+?
+      WHERE telegram_id=?
+    `)
+    .bind(
+      Number(d.amount),
+      Number(d.amount),
+      d.telegram_id
+    )
+    .run();
+
+  if (Number(userUpdate.meta.changes) !== 1) {
+    console.error(
+      "DEPOSIT PAID nhưng không tìm thấy user:",
+      d.telegram_id,
+      d.id
+    );
+  }
+
+  const paid = await env.DB
+    .prepare(`SELECT * FROM deposits WHERE id=?`)
+    .bind(d.id)
+    .first();
+
+  await notifyAdminDepositPaid(env, paid).catch(
+    e => console.error("admin paid notification", e)
+  );
+
+  await notifyPaid(env, paid).catch(
+    e => console.error("user paid notification", e)
+  );
+
+  return paid;
+}
+
+
+/* =========================================================
+   SEPAY WEBHOOK
+========================================================= */
+
+async function verifySePayWebhook(request, rawBody, env) {
+  /*
+    Hỗ trợ API Key:
+      SEPAY_WEBHOOK_API_KEY
+
+    Nếu m dùng HMAC-SHA256 thì đặt:
+      SEPAY_WEBHOOK_SECRET
+
+    Có một trong hai là đủ.
+  */
+
+  if (env.SEPAY_WEBHOOK_API_KEY) {
+    const auth = request.headers.get("Authorization") || "";
+    const expected = `Apikey ${env.SEPAY_WEBHOOK_API_KEY}`;
+
+    if (auth === expected) return true;
+  }
+
+  if (!env.SEPAY_WEBHOOK_SECRET) return false;
+
+  const signature =
+    request.headers.get("X-SePay-Signature") || "";
+
+  const timestamp =
+    request.headers.get("X-SePay-Timestamp") || "";
+
+  if (!signature || !timestamp) return false;
+
+  const ts = Number(timestamp);
+  const now = Math.floor(Date.now() / 1000);
+
+  /*
+    Chống replay webhook quá 5 phút.
+  */
+  if (!Number.isFinite(ts) || Math.abs(now - ts) > 300) {
+    return false;
+  }
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.SEPAY_WEBHOOK_SECRET),
+    {
+      name: "HMAC",
+      hash: "SHA-256"
+    },
+    false,
+    ["sign"]
+  );
+
+  const signed = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(`${timestamp}.${rawBody}`)
+  );
+
+  const hex = Array.from(new Uint8Array(signed))
+    .map(x => x.toString(16).padStart(2, "0"))
+    .join("");
+
+  return signature === `sha256=${hex}`;
+}
+
+
+function sepayTransferAmount(payload) {
+  return Number(
+    payload.transferAmount ??
+    payload.amount ??
+    payload.transactionAmount ??
+    0
+  );
+}
+
+
+function sepayTransferContent(payload) {
+  return String(
+    payload.content ??
+    payload.description ??
+    payload.addInfo ??
+    payload.transferDescription ??
+    ""
+  ).toUpperCase();
+}
+
+
+function sepayTransferId(payload) {
+  return String(
+    payload.id ??
+    payload.transactionId ??
+    payload.transaction_id ??
+    payload.referenceCode ??
+    payload.referenceNo ??
+    ""
+  );
+}
+
+
+async function handleSePayWebhook(request, env) {
+  const rawBody = await request.text();
+
+  const verified = await verifySePayWebhook(
+    request,
+    rawBody,
+    env
+  );
+
+  if (!verified) {
+    return new Response("Unauthorized", {
+      status: 401
+    });
+  }
+
+  let payload;
+
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return new Response("Bad JSON", {
+      status: 400
+    });
+  }
+
+  const transferType = String(
+    payload.transferType ??
+    payload.transfer_type ??
+    ""
+  ).toLowerCase();
+
+  /*
+    Chỉ xử lý tiền vào.
+  */
+  if (
+    transferType === "out" ||
+    transferType === "debit"
+  ) {
+    return new Response("OK");
+  }
+
+  const amount = sepayTransferAmount(payload);
+  const content = sepayTransferContent(payload);
+  const transactionId = sepayTransferId(payload);
+
+  if (!amount || amount <= 0 || !transactionId) {
+    return new Response("OK");
+  }
+
+  /*
+    Nếu khai báo SEPAY_BANK_ACCOUNT thì bắt buộc
+    giao dịch phải vào đúng tài khoản này.
+  */
+  if (env.SEPAY_BANK_ACCOUNT) {
+    const accountNumber = String(
+      payload.accountNumber ??
+      payload.account_number ??
+      ""
+    );
+
+    if (
+      accountNumber &&
+      accountNumber !== String(env.SEPAY_BANK_ACCOUNT)
+    ) {
+      return new Response("OK");
+    }
+  }
+
+  /*
+    Tìm đơn PENDING theo số tiền + mã NAP.
+  */
+  const pending = await env.DB
+    .prepare(`
+      SELECT *
+      FROM deposits
+      WHERE
+        status='PENDING'
+        AND expires_at>?
+        AND amount=?
+      ORDER BY created_at ASC
+      LIMIT 50
+    `)
+    .bind(nowISO(), amount)
+    .all();
+
+  const sepayAccount =
+    String(
+      payload.accountNumber ??
+      payload.account_number ??
+      payload.accountNo ??
+      payload.account ??
+      ""
+    ).trim();
+
+  const configuredAccount =
+    String(
+      env.SEPAY_BANK_ACCOUNT ||
+      env.MB_ACCOUNT_NUMBER ||
+      ""
+    ).trim();
+
+  if (
+    configuredAccount &&
+    (
+      !sepayAccount ||
+      sepayAccount !== configuredAccount
+    )
+  ) {
+    console.log(
+      "Bỏ qua SePay webhook: sai tài khoản nhận",
+      {
+        received: sepayAccount,
+        expected: configuredAccount
+      }
+    );
+
+    return new Response("OK");
+  }
+
+  const d = (pending.results || []).find(
+    x =>
+      content.includes(
+        String(x.content || "").toUpperCase()
+      )
+  );
+
+  if (!d) {
+    /*
+      Giao dịch không thuộc bot thì trả 200 để
+      SePay không retry vô hạn.
+    */
+    return new Response("OK");
+  }
+
+  const result = await settleDeposit(
+    env,
+    d,
+    transactionId,
+    rawBody
+  );
+
+  if (result?.status === "PAID") {
+    return new Response("OK");
+  }
+
+  return new Response("OK");
+}
+
+
+/* =========================================================
    CHECK DEPOSIT
 ========================================================= */
 
@@ -2548,73 +3019,12 @@ async function checkDeposit(
     txId(match) ||
     rid("MB");
 
-  /*
-    Claim đơn trước.
-    Chỉ request nào update thành công
-    mới được cộng tiền.
-  */
-
-  const claim = await env.DB
-    .prepare(`
-      UPDATE deposits
-      SET
-        status='PAID',
-        bank_transaction_id=?,
-        bank_raw=?,
-        paid_at=?
-      WHERE
-        id=?
-        AND status='PENDING'
-    `)
-    .bind(
-      transactionId,
-      JSON.stringify(match).slice(
-        0,
-        20000
-      ),
-      nowISO(),
-      d.id
-    )
-    .run();
-
-  if (
-    Number(
-      claim.meta.changes
-    ) !== 1
-  ) {
-    return env.DB
-      .prepare(`
-        SELECT *
-        FROM deposits
-        WHERE id=?
-      `)
-      .bind(d.id)
-      .first();
-  }
-
-  await env.DB
-    .prepare(`
-      UPDATE users
-      SET
-        balance=balance+?,
-        total_deposit=total_deposit+?
-      WHERE telegram_id=?
-    `)
-    .bind(
-      d.amount,
-      d.amount,
-      d.telegram_id
-    )
-    .run();
-
-  return env.DB
-    .prepare(`
-      SELECT *
-      FROM deposits
-      WHERE id=?
-    `)
-    .bind(d.id)
-    .first();
+  return settleDeposit(
+    env,
+    d,
+    transactionId,
+    JSON.stringify(match)
+  );
 }
 
 
@@ -4972,6 +5382,30 @@ export default {
     ) {
       return new Response(
         "MB Shop Bot OK"
+      );
+    }
+
+    if (
+      request.method === "POST" &&
+      u.pathname === "/sepay-webhook"
+    ) {
+      return handleSePayWebhook(
+        request,
+        env
+      ).catch(
+        e => {
+          console.error(
+            "sepay webhook",
+            e
+          );
+
+          return new Response(
+            "Webhook error",
+            {
+              status: 500
+            }
+          );
+        }
       );
     }
 
