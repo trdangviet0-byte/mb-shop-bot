@@ -1,5 +1,5 @@
-name = "mb-shop-complete"
-main = "src/index.js"
+name = "mb-shop-bot"
+main = "index.js"
 compatibility_date = "2026-08-18"
 
 [triggers]
