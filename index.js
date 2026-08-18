@@ -1,3 +1,8 @@
+const ADMIN_ID = "7424477198";
+
+function isAdmin(userId) {
+  return String(userId) === ADMIN_ID;
+}
 const PRODUCTS = [
   ["fluorite","Fluorite"],["migui-lite","Migui Lite"],["migui-pro","Migui Pro"],["drip-client","Drip Client"],
   ["esign","Chứng Chỉ Esign"],["8bp-fluorite","8BP_Fluorite"],["proxy-android","Proxy Androi"],["lien-quan","Liên Quân"],
