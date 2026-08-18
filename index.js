@@ -89,8 +89,29 @@ async function sendOrEdit(env, chatId, messageId, text, keyboard) {
   return tg(env,"sendMessage",body);
 }
 
-async function showHome(env, chatId, messageId, name) {
-  return sendOrEdit(env,chatId,messageId,homeText(env,name),homeKeyboard());
+function homeKeyboard(userId = null){
+  const rows = [
+    [
+      {text:"🛍️ Mua Key / Acc FF",callback_data:"buy"},
+      {text:"💳 Nạp Tiền",callback_data:"deposit"}
+    ],
+    [
+      {text:"💎 Cá Nhân",callback_data:"profile"},
+      {text:"🏆 Top Nạp",callback_data:"top"}
+    ],
+    [
+      {text:"📜 Lịch Sử Nạp",callback_data:"history"},
+      {text:"🧑‍💻 Hỗ Trợ",callback_data:"support"}
+    ]
+  ];
+
+  if (isAdmin(userId)) {
+    rows.push([
+      {text:"🛠️ ADMIN PANEL",callback_data:"admin"}
+    ]);
+  }
+
+  return {inline_keyboard: rows};
 }
 
 async function showProducts(env,chatId,messageId) {
