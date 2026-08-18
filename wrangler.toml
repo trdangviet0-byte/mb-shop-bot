@@ -8,7 +8,7 @@ crons = ["*/1 * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "mb-shop-db"
-database_id = "REPLACE_D1_DATABASE_ID"
+database_id = "3727d446-c8ca-441a-8230-e76f7640fe35"
 
 [vars]
 SHOP_NAME = "RUS TAY IOS STORE"
