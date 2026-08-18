@@ -51,7 +51,7 @@ async function ensureUser(env, from) {
   return env.DB.prepare("SELECT * FROM users WHERE telegram_id=?").bind(String(from.id)).first();
 }
 
-function homeKeyboard(userId = null){
+function homeKeyboard(userId){
   const rows = [
     [
       {text:"🛍️ Mua Key / Acc FF",callback_data:"buy"},
@@ -69,9 +69,12 @@ function homeKeyboard(userId = null){
 
   if (isAdmin(userId)) {
     rows.push([
-      {text:"🛠️ ADMIN PANEL",callback_data:"admin"}
+      {text:"⚙️ Admin Panel",callback_data:"admin"}
     ]);
   }
+
+  return { inline_keyboard: rows };
+}
 
   return {inline_keyboard: rows};
 }
@@ -113,7 +116,55 @@ function homeKeyboard(userId = null){
 
   return {inline_keyboard: rows};
 }
+async function showAdminPanel(env, chatId, messageId) {
+  const users = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM users"
+  ).first();
 
+  const pending = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM deposits WHERE status='PENDING'"
+  ).first();
+
+  const paid = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM deposits WHERE status='PAID'"
+  ).first();
+
+  const totalBalance = await env.DB.prepare(
+    "SELECT COALESCE(SUM(balance),0) AS total FROM users"
+  ).first();
+
+  const text = `
+⚙️ <b>ADMIN PANEL</b>
+━━━━━━━━━━━━
+
+👥 Tổng tài khoản: <b>${users.c}</b>
+⏳ Đơn nạp chờ duyệt: <b>${pending.c}</b>
+✅ Đơn đã duyệt: <b>${paid.c}</b>
+💰 Tổng số dư user: <b>${money(totalBalance.total)}</b>
+
+Chọn chức năng bên dưới:
+`;
+
+  return sendOrEdit(
+    env,
+    chatId,
+    messageId,
+    text,
+    {
+      inline_keyboard: [
+        [
+          { text: "⏳ Duyệt đơn nạp", callback_data: "admin_deposits" }
+        ],
+        [
+          { text: "👥 Danh sách user", callback_data: "admin_users" }
+        ],
+        [
+          { text: "⬅️ Trang chủ", callback_data: "home" }
+        ]
+      ]
+    }
+  );
+}
 async function showProducts(env,chatId,messageId) {
   const ps=await env.DB.prepare("SELECT id,name,emoji FROM products WHERE active=1 ORDER BY sort_order").all();
   const rows=[];
@@ -332,7 +383,15 @@ async function handleUpdate(env,update) {
   if(update.message?.from) {
     await ensureUser(env,update.message.from);
     const m=update.message;
-    if(m.text==="/start") return showHome(env,m.chat.id,null,m.from.first_name||m.from.username||"bạn");
+if(m.text && m.text.startsWith("/start")) {
+  return showHome(
+    env,
+    m.chat.id,
+    null,
+    m.from.first_name || m.from.username || "bạn",
+    m.from.id
+  );
+}
     if(m.text) {
       const created=await createDeposit(env,m);
       if(created) return;
@@ -346,7 +405,31 @@ async function handleUpdate(env,update) {
   if(data==="noop") return tg(env,"answerCallbackQuery",{callback_query_id:q.id});
   await tg(env,"answerCallbackQuery",{callback_query_id:q.id}).catch(()=>{});
 
-  if(data==="home") return showHome(env,chatId,msgId,q.from.first_name||q.from.username||"bạn");
+if(data==="home") {
+  return showHome(
+    env,
+    chatId,
+    msgId,
+    q.from.first_name || q.from.username || "bạn",
+    q.from.id
+  );
+}
+
+if(data==="admin") {
+  if (!isAdmin(userId)) {
+    return tg(env,"answerCallbackQuery",{
+      callback_query_id:q.id,
+      text:"Bạn không có quyền truy cập Admin Panel!",
+      show_alert:true
+    });
+  }
+
+  return showAdminPanel(
+    env,
+    chatId,
+    msgId
+  );
+}
   if(data==="buy") return showProducts(env,chatId,msgId);
   if(data==="deposit") return promptDeposit(env,chatId,msgId,userId);
   if(data==="profile") return showProfile(env,chatId,msgId,user);
