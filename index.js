@@ -554,7 +554,7 @@ function homeKeyboard(
   if (isAdmin(userId)) {
     rows.push([
       {
-        text: "🛠️ ADMIN PANEL",
+        text: "⚙️ ADMIN PANEL",
         callback_data: "admin"
       }
     ]);
