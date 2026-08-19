@@ -1983,14 +1983,6 @@ async function createDeposit(
           [
             {
               text:
-                "🔄 Kiểm Tra Thanh Toán",
-              callback_data:
-                `check:${id}`
-            }
-          ],
-          [
-            {
-              text:
                 "⬅️ Trang Chủ",
               callback_data:
                 "home"
