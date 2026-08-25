@@ -2036,9 +2036,7 @@ async function showProfile(
     `💸 Tổng chi: <b>${money(
       user.total_spent
     )}</b>\n\n` +
-
-    `🔗 Link giới thiệu:\n` +
-    `<code>${esc(ref)}</code>`,
+     
     {
       inline_keyboard: [
         [
