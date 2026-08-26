@@ -172,23 +172,6 @@ async function tg(env, method, body) {
 async function ensureSchema(env) {
   await env.DB.batch([
     env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS deposits (
-        id TEXT PRIMARY KEY,
-        telegram_id TEXT NOT NULL,
-        amount INTEGER NOT NULL DEFAULT 0,
-        content TEXT DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'INPUT',
-        expires_at TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        paid_at TEXT,
-        bank_transaction_id TEXT,
-        bank_raw TEXT,
-        notified_at TEXT,
-        admin_pending_notified_at TEXT,
-        admin_paid_notified_at TEXT
-      )
-    `),
-    env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS admin_states (
         telegram_id TEXT PRIMARY KEY,
         action TEXT NOT NULL,
@@ -1793,47 +1776,64 @@ async function promptDeposit(
   messageId,
   userId
 ) {
-  try {
-    await env.DB
-      .prepare(`
-        UPDATE deposits
-        SET status='EXPIRED'
-        WHERE telegram_id=? AND status='INPUT'
-      `)
-      .bind(String(userId))
-      .run();
+  // Xóa phiên nạp đang treo để tránh lỗi UNIQUE content=INPUT
+  await env.DB
+    .prepare(`
+      DELETE FROM deposits
+      WHERE telegram_id=? AND status='INPUT'
+    `)
+    .bind(String(userId))
+    .run();
 
-    const inputId = rid("INPUT");
+  await env.DB
+    .prepare(`
+      INSERT INTO deposits(
+        id,
+        telegram_id,
+        amount,
+        content,
+        status,
+        expires_at
+      )
+      VALUES(?,?,?,?,?,?)
+    `)
+    .bind(
+      rid("INPUT"),
+      String(userId),
+      0,
+      "INPUT",
+      "INPUT",
+      addMin(10)
+    )
+    .run();
 
-    await env.DB
-      .prepare(`
-        INSERT INTO deposits(
-          id, telegram_id, amount, content, status, expires_at, created_at
-        )
-        VALUES(?,?,?,?,?,?,?)
-      `)
-      .bind(inputId, String(userId), 0, "INPUT", "INPUT", addMin(10), nowISO())
-      .run();
+  return sendOrEdit(
+    env,
+    chatId,
+    messageId,
+    `💳 <b>NẠP TIỀN</b>\n\n` +
 
-    return await sendOrEdit(
-      env, chatId, messageId,
-      `💳 <b>NẠP TIỀN</b>\n\n` +
-      `Nhập số tiền muốn nạp.\n\n` +
-      `💰 Tối thiểu: <b>${money(env.MIN_DEPOSIT || 10000)}</b>\n\n` +
-      `Ví dụ: <code>50000</code>`,
-      { inline_keyboard: [[{ text: "⬅️ Hủy", callback_data: "home" }]] }
-    );
-  } catch (e) {
-    console.error("prompt deposit", e);
-    try {
-      await tg(env, "sendMessage", {
-        chat_id: chatId, parse_mode: "HTML",
-        text: `⚠️ <b>Không thể mở chức năng nạp tiền.</b>\n\nBot đang gặp lỗi cơ sở dữ liệu. Vui lòng thử lại sau.`
-      });
-    } catch (sendErr) { console.error("prompt deposit error message", sendErr); }
-    return null;
-  }
+    `Nhập số tiền muốn nạp.\n\n` +
+
+    `💰 Tối thiểu: <b>${money(
+      env.MIN_DEPOSIT || 10000
+    )}</b>\n\n` +
+
+    `Ví dụ: <code>50000</code>`,
+    {
+      inline_keyboard: [
+        [
+          {
+            text: "⬅️ Hủy",
+            callback_data:
+              "home"
+          }
+        ]
+      ]
+    }
+  );
 }
+
 
 async function createDeposit(
   env,
@@ -5064,15 +5064,12 @@ async function handleUpdate(
   ======================================================= */
 
   if (data === "deposit") {
-    try {
-      return await promptDeposit(env, chatId, msgId, userId);
-    } catch (e) {
-      console.error("deposit callback", e);
-      return tg(env, "sendMessage", {
-        chat_id: chatId, parse_mode: "HTML",
-        text: `⚠️ <b>Không thể mở nạp tiền.</b>\nVui lòng thử lại sau.`
-      }).catch(() => {});
-    }
+    return promptDeposit(
+      env,
+      chatId,
+      msgId,
+      userId
+    );
   }
 
 
