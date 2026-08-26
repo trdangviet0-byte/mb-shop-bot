@@ -2035,7 +2035,7 @@ async function showProfile(
 
     `💸 Tổng chi: <b>${money(
       user.total_spent
-    )}</b>\n\n` + 
+    )}</b>\n\n`,
     {
       inline_keyboard: [
         [
