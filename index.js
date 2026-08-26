@@ -8,11 +8,6 @@ const SEPAY_BANK_ACCOUNT_ENV = "SEPAY_BANK_ACCOUNT";
    CONFIG
 ========================================================= */
 
-// Mixkit "Select click" (1109) — âm thanh khi chọn sản phẩm.
-// Có thể đổi bằng biến môi trường PRODUCT_SOUND_URL nếu muốn.
-const PRODUCT_SOUND_URL =
-  "https://assets.mixkit.co/sfx/preview/mixkit-select-click-1109.mp3";
-
 const PRODUCTS = [
   ["fluorite", "Fluorite"],
   ["migui-lite", "Migui Lite"],
@@ -227,13 +222,6 @@ async function ensureSchema(env) {
     await env.DB.prepare(`
       CREATE INDEX IF NOT EXISTS idx_deposits_status
       ON deposits(status)
-    `).run();
-  } catch {}
-
-  try {
-    await env.DB.prepare(`
-      CREATE INDEX IF NOT EXISTS idx_deposits_user_status_created
-      ON deposits(telegram_id, status, created_at)
     `).run();
   } catch {}
 
@@ -1213,36 +1201,6 @@ async function showAdminUsers(
 
 
 /* =========================================================
-   PRODUCT SOUND
-========================================================= */
-
-async function playProductSound(env, chatId) {
-  const audio =
-    env.PRODUCT_SOUND_URL ||
-    PRODUCT_SOUND_URL;
-
-  if (!audio) return;
-
-  try {
-    await tg(
-      env,
-      "sendAudio",
-      {
-        chat_id: chatId,
-        audio,
-        title: "Select click",
-        performer: "Mixkit",
-        disable_notification: true
-      }
-    );
-  } catch (e) {
-    // Âm thanh không được phép làm hỏng thao tác chọn sản phẩm.
-    console.error("product sound", e);
-  }
-}
-
-
-/* =========================================================
    PRODUCTS USER
 ========================================================= */
 
@@ -1776,11 +1734,12 @@ async function promptDeposit(
   messageId,
   userId
 ) {
-  // Xóa phiên nạp đang treo để tránh lỗi UNIQUE content=INPUT
   await env.DB
     .prepare(`
       DELETE FROM deposits
-      WHERE telegram_id=? AND status='INPUT'
+      WHERE
+        telegram_id=?
+        AND status='INPUT'
     `)
     .bind(String(userId))
     .run();
@@ -2076,7 +2035,7 @@ async function showProfile(
 
     `💸 Tổng chi: <b>${money(
       user.total_spent
-    )}</b>\n\n` + 
+    )}</b>\n\n`,
     {
       inline_keyboard: [
         [
@@ -5135,8 +5094,6 @@ async function handleUpdate(
   if (
     data.startsWith("p:")
   ) {
-    playProductSound(env, chatId).catch(() => {});
-
     return showProduct(
       env,
       chatId,
@@ -5153,8 +5110,6 @@ async function handleUpdate(
   if (
     data.startsWith("i:")
   ) {
-    playProductSound(env, chatId).catch(() => {});
-
     return showItem(
       env,
       chatId,
