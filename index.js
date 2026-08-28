@@ -1759,6 +1759,19 @@ async function promptDeposit(
 
     const inputId = rid("INPUT");
 
+    /*
+      deposits.content đang có UNIQUE constraint.
+      Không được dùng "INPUT" cố định vì user khác có thể
+      đang có một row INPUT với cùng content.
+      Dùng giá trị riêng cho từng lần nhập tiền; sau khi
+      nhập số tiền, createDeposit() sẽ thay bằng mã NAPxxxx.
+    */
+    const inputContent =
+      `INPUT_${String(userId)}_${Date.now()}_${crypto.randomUUID()
+        .replace(/-/g, "")
+        .slice(0, 6)
+        .toUpperCase()}`;
+
     await env.DB
       .prepare(`
         INSERT INTO deposits(
@@ -1776,7 +1789,7 @@ async function promptDeposit(
         inputId,
         String(userId),
         0,
-        "INPUT",
+        inputContent,
         "INPUT",
         addMin(10),
         nowISO()
