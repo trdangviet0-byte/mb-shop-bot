@@ -183,6 +183,18 @@ async function ensureSchema(env) {
     `)
   ]);
 
+  /*
+    DEPOSITS SCHEMA MIGRATION
+    Một số DB cũ có bảng deposits nhưng thiếu created_at.
+    createDeposit() dùng created_at để lấy INPUT mới nhất.
+  */
+  try {
+    await env.DB.prepare(`
+      ALTER TABLE deposits
+      ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    `).run();
+  } catch {}
+
   try {
     await env.DB.prepare(`
       ALTER TABLE deposits
@@ -1734,65 +1746,90 @@ async function promptDeposit(
   messageId,
   userId
 ) {
-  await env.DB
-    .prepare(`
-      DELETE FROM deposits
-      WHERE
-        telegram_id=?
-        AND status='INPUT'
-    `)
-    .bind(String(userId))
-    .run();
+  try {
+    await env.DB
+      .prepare(`
+        DELETE FROM deposits
+        WHERE
+          telegram_id=?
+          AND status='INPUT'
+      `)
+      .bind(String(userId))
+      .run();
 
-  await env.DB
-    .prepare(`
-      INSERT INTO deposits(
-        id,
-        telegram_id,
-        amount,
-        content,
-        status,
-        expires_at
+    const inputId = rid("INPUT");
+
+    await env.DB
+      .prepare(`
+        INSERT INTO deposits(
+          id,
+          telegram_id,
+          amount,
+          content,
+          status,
+          expires_at,
+          created_at
+        )
+        VALUES(?,?,?,?,?,?,?)
+      `)
+      .bind(
+        inputId,
+        String(userId),
+        0,
+        "INPUT",
+        "INPUT",
+        addMin(10),
+        nowISO()
       )
-      VALUES(?,?,?,?,?,?)
-    `)
-    .bind(
-      rid("INPUT"),
-      String(userId),
-      0,
-      "INPUT",
-      "INPUT",
-      addMin(10)
-    )
-    .run();
+      .run();
 
-  return sendOrEdit(
-    env,
-    chatId,
-    messageId,
-    `💳 <b>NẠP TIỀN</b>\n\n` +
-
-    `Nhập số tiền muốn nạp.\n\n` +
-
-    `💰 Tối thiểu: <b>${money(
-      env.MIN_DEPOSIT || 10000
-    )}</b>\n\n` +
-
-    `Ví dụ: <code>50000</code>`,
-    {
-      inline_keyboard: [
-        [
-          {
-            text: "⬅️ Hủy",
-            callback_data:
-              "home"
-          }
+    return sendOrEdit(
+      env,
+      chatId,
+      messageId,
+      `💳 <b>NẠP TIỀN</b>\n\n` +
+      `Nhập số tiền muốn nạp.\n\n` +
+      `💰 Tối thiểu: <b>${money(
+        env.MIN_DEPOSIT || 10000
+      )}</b>\n\n` +
+      `Ví dụ: <code>50000</code>`,
+      {
+        inline_keyboard: [
+          [
+            {
+              text: "⬅️ Hủy",
+              callback_data: "home"
+            }
+          ]
         ]
-      ]
-    }
-  );
-}
+      }
+    );
+  } catch (e) {
+    console.error("promptDeposit", e);
 
+    // ACK was already sent in handleUpdate, so now send a real error
+    // instead of silently failing.
+    try {
+      await tg(
+        env,
+        "sendMessage",
+        {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `⚠️ <b>Không mở được Nạp Tiền.</b>\n\n` +
+            `Lỗi hệ thống: <code>${esc(
+              e?.message || e
+            )}</code>`
+        }
+      );
+    } catch (sendError) {
+      console.error("promptDeposit error reply", sendError);
+    }
+
+    return false;
+  }
+}
 
 async function createDeposit(
   env,
@@ -1806,18 +1843,42 @@ async function createDeposit(
     đang ở trạng thái INPUT.
   */
 
-  const input = await env.DB
-    .prepare(`
-      SELECT *
-      FROM deposits
-      WHERE
-        telegram_id=?
-        AND status='INPUT'
-      ORDER BY created_at DESC
-      LIMIT 1
-    `)
-    .bind(uid)
-    .first();
+  let input;
+
+  try {
+    input = await env.DB
+      .prepare(`
+        SELECT *
+        FROM deposits
+        WHERE
+          telegram_id=?
+          AND status='INPUT'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `)
+      .bind(uid)
+      .first();
+  } catch (e) {
+    console.error("createDeposit input lookup", e);
+
+    await tg(
+      env,
+      "sendMessage",
+      {
+        chat_id: message.chat.id,
+        parse_mode: "HTML",
+        text:
+          `⚠️ <b>Hệ thống nạp tiền đang lỗi.</b>
+
+` +
+          `Vui lòng báo Admin kiểm tra database.`
+      }
+    ).catch(err =>
+      console.error("createDeposit error reply", err)
+    );
+
+    return true;
+  }
 
   if (!input) {
     return false;
